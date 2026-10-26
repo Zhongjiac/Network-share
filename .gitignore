@@ -1,0 +1,42 @@
+# ==============================================================================
+# LAN Fast Share - Git 忽略规则
+# ==============================================================================
+
+# 1. 用户共享目录 (保护个人私密文件，仅保留空目录跟踪)
+shared_files/*
+!shared_files/.gitkeep
+!shared_files/请将要分享的文件放入此目录.txt
+
+# 2. 本地便携打包发行版 (避免大体积二进制文件膨胀 Git 历史)
+*.zip
+LAN-Fast-Share-Portable.zip
+
+# 3. 本地动态运行时网络快照
+web/server-info.json
+
+# 4. Python 编译缓存与虚拟环境
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+.pytest_cache/
+
+# 5. 基准测试与调试临时输出
+benchmark_temp/
+*.tmp
+*.log
+test_upload_*
+
+# 6. 操作系统与编辑器临时文件
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace

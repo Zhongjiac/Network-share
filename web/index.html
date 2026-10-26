@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>LAN Fast Share - 局域网极速快传</title>
+    <link rel="stylesheet" href="__ASSETS_PREFIX__style.css">
+    <script>
+        const __RAW_INDEX__ = "__INDEX_DATA__";
+        const __RAW_PATH__ = "__PATH_PREFIX__";
+        const __RAW_ASSETS__ = "__ASSETS_PREFIX__";
+        window.DUFS_INDEX_DATA = __RAW_INDEX__;
+        window.DUFS_PATH_PREFIX = __RAW_PATH__;
+        window.DUFS_ASSETS_PREFIX = __RAW_ASSETS__;
+    </script>
+</head>
+<body>
+    <!-- 全局背景光晕 -->
+    <div class="bg-glow bg-glow-1"></div>
+    <div class="bg-glow bg-glow-2"></div>
+
+    <div class="app-layout">
+        <!-- 顶部导航栏 -->
+        <header class="app-header">
+            <div class="header-left">
+                <div class="brand-logo">
+                    <span class="logo-icon">⚡</span>
+                    <span class="logo-text">LAN Fast Share</span>
+                </div>
+                <div class="network-badge" title="局域网物理连接状态正常">
+                    <span class="pulse-dot"></span>
+                    <span class="network-text">局域网已连接</span>
+                </div>
+                <div class="stat-badge" id="dirStats">
+                    <span id="statText">0 个项目</span>
+                </div>
+            </div>
+
+            <div class="header-right">
+                <!-- 主题切换 -->
+                <button class="icon-btn" id="themeToggleBtn" title="切换深色/浅色模式">
+                    <span class="icon-theme-sun">☀️</span>
+                    <span class="icon-theme-moon">🌙</span>
+                </button>
+                <!-- 手机扫码连接 -->
+                <button class="icon-btn" id="qrModalBtn" title="手机扫码互联">
+                    <span>📱</span>
+                    <span class="btn-text-sm">手机扫码</span>
+                </button>
+                <!-- 传输中心入口 -->
+                <button class="header-transfer-btn" id="headerTransferBtn" title="打开传输任务中心">
+                    <span>⚡ 传输中心</span>
+                    <span class="badge-count" id="headerActiveCount" style="display:none;">0</span>
+                </button>
+            </div>
+        </header>
+
+        <!-- 工具栏 -->
+        <div class="app-toolbar">
+            <div class="toolbar-left">
+                <button class="nav-btn" id="upDirBtn" title="返回上一级">
+                    <span>⬆ 上一级</span>
+                </button>
+                <!-- 面包屑导航 -->
+                <nav class="breadcrumbs" id="breadcrumbs" aria-label="目录层级导航">
+                    <!-- 动态生成面包屑 -->
+                </nav>
+            </div>
+
+            <div class="toolbar-right">
+                <!-- 实时搜索过滤 -->
+                <div class="search-box">
+                    <span class="search-icon">🔍</span>
+                    <input type="text" id="searchInput" placeholder="在当前目录过滤文件..." autocomplete="off">
+                    <button class="clear-search-btn" id="clearSearchBtn" style="display:none;">✕</button>
+                </div>
+
+                <!-- 排序方式 -->
+                <div class="dropdown-wrapper">
+                    <select id="sortSelect" class="select-control" title="排序方式">
+                        <option value="name-asc">名称 ↑</option>
+                        <option value="name-desc">名称 ↓</option>
+                        <option value="mtime-desc">最新修改 ↓</option>
+                        <option value="mtime-asc">最早修改 ↑</option>
+                        <option value="size-desc">大小 (大➔小)</option>
+                        <option value="size-asc">大小 (小➔大)</option>
+                    </select>
+                </div>
+
+                <!-- 视图切换 -->
+                <div class="view-toggle-group">
+                    <button class="view-btn active" id="listViewBtn" title="列表视图">📋</button>
+                    <button class="view-btn" id="gridViewBtn" title="网格缩略图视图">⊞</button>
+                </div>
+
+                <!-- 核心操作按钮组 -->
+                <div class="action-btn-group">
+                    <button class="action-btn primary" id="uploadFileBtn" title="上传文件 (支持多选)">
+                        <span>📤 上传文件</span>
+                    </button>
+                    <button class="action-btn secondary" id="uploadFolderBtn" title="上传文件夹">
+                        <span>📁 上传目录</span>
+                    </button>
+                    <button class="action-btn secondary" id="newFolderBtn" title="新建文件夹">
+                        <span>➕ 新建文件夹</span>
+                    </button>
+                    <button class="action-btn outline" id="downloadZipBtn" title="打包下载当前目录">
+                        <span>📦 打包.zip</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 主内容区 -->
+        <main class="app-main">
+            <!-- 列表视图表格 -->
+            <div class="file-table-wrapper" id="listViewContainer">
+                <table class="file-table">
+                    <thead>
+                        <tr>
+                            <th class="col-checkbox">
+                                <input type="checkbox" id="selectAllCheckbox" title="全选 / 取消全选">
+                            </th>
+                            <th class="col-name sortable" data-sort="name">名称</th>
+                            <th class="col-size sortable" data-sort="size">大小</th>
+                            <th class="col-mtime sortable" data-sort="mtime">修改时间</th>
+                            <th class="col-actions">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="fileTableBody">
+                        <!-- 文件行动态渲染 -->
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- 网格视图卡片容器 -->
+            <div class="file-grid-wrapper" id="gridViewContainer" style="display:none;">
+                <div class="grid-container" id="gridItemsContainer">
+                    <!-- 网格卡片动态渲染 -->
+                </div>
+            </div>
+
+            <!-- 空目录状态 -->
+            <div class="empty-state" id="emptyState" style="display:none;">
+                <div class="empty-icon">📂</div>
+                <h3>当前目录空空如也</h3>
+                <p>将文件拖拽至此，或点击上方“上传文件”按钮极速投送</p>
+            </div>
+        </main>
+    </div>
+
+    <!-- 全屏拖拽上传遮罩 -->
+    <div class="drop-overlay" id="dropOverlay">
+        <div class="drop-content">
+            <div class="drop-icon">🚀</div>
+            <h2>松开鼠标立即上传</h2>
+            <p>支持多文件或整文件夹拖拽，批量极速传输</p>
+        </div>
+    </div>
+
+    <!-- 底部悬浮批量操作坞 (Batch Action Dock) -->
+    <div class="batch-dock" id="batchDock">
+        <div class="batch-info">
+            <span class="batch-badge" id="batchSelectedCount">已选 0 项</span>
+            <span class="batch-size" id="batchSelectedSize">(0 B)</span>
+        </div>
+        <div class="batch-actions">
+            <button class="batch-btn primary" id="batchDownloadBtn" title="批量加入传输中心下载队列">
+                <span>⬇ 批量下载</span>
+            </button>
+            <button class="batch-btn secondary" id="batchZipBtn" title="打包为 Zip 下载">
+                <span>📦 打包下载</span>
+            </button>
+            <button class="batch-btn danger" id="batchDeleteBtn" title="批量删除选中项目">
+                <span>🗑 批量删除</span>
+            </button>
+            <button class="batch-btn text" id="batchCancelBtn" title="取消所有选择">
+                <span>取消</span>
+            </button>
+        </div>
+    </div>
+
+    <!-- 悬浮胶囊按钮 (右下角常驻状态) -->
+    <div class="transfer-capsule" id="transferCapsule" title="点击展开/收起传输任务中心">
+        <div class="capsule-icon">⚡</div>
+        <div class="capsule-speeds">
+            <span class="speed-up" id="capsuleUpSpeed">↑ 0.0 MB/s</span>
+            <span class="speed-down" id="capsuleDownSpeed">↓ 0.0 MB/s</span>
+        </div>
+        <div class="capsule-badge" id="capsuleBadge" style="display:none;">0</div>
+    </div>
+
+    <!-- 专业级【传输任务中心抽屉 (Transfer Manager Drawer)】 -->
+    <aside class="transfer-drawer" id="transferDrawer">
+        <div class="drawer-header">
+            <div class="drawer-title">
+                <span class="title-icon">⚡</span>
+                <h3>传输任务中心</h3>
+            </div>
+            <div class="drawer-controls">
+                <button class="drawer-action-btn" id="resumeAllBtn" title="全部开始">▶ 全部开始</button>
+                <button class="drawer-action-btn" id="pauseAllBtn" title="全部暂停">⏸ 全部暂停</button>
+                <button class="drawer-action-btn" id="clearCompletedBtn" title="清空已完成记录">🧹 清空已完成</button>
+                <button class="drawer-close-btn" id="closeDrawerBtn" title="折叠面板">✕</button>
+            </div>
+        </div>
+
+        <div class="drawer-tabs">
+            <button class="tab-btn active" id="tabUploadBtn">
+                <span>📤 上传任务</span>
+                <span class="tab-badge" id="tabUploadBadge">0</span>
+            </button>
+            <button class="tab-btn" id="tabDownloadBtn">
+                <span>📥 下载任务</span>
+                <span class="tab-badge" id="tabDownloadBadge">0</span>
+            </button>
+        </div>
+
+        <div class="drawer-body">
+            <!-- 上传任务列表 -->
+            <div class="task-list" id="uploadTaskList">
+                <div class="task-empty-state" id="uploadEmptyState">
+                    <p>暂无正在进行的上传任务</p>
+                </div>
+            </div>
+
+            <!-- 下载任务列表 -->
+            <div class="task-list" id="downloadTaskList" style="display:none;">
+                <div class="task-empty-state" id="downloadEmptyState">
+                    <p>暂无正在进行的下载任务</p>
+                </div>
+            </div>
+        </div>
+    </aside>
+
+    <!-- 在线多媒体预览模态框 (Lightbox) -->
+    <div class="modal-overlay" id="previewModal">
+        <div class="preview-container">
+            <div class="preview-header">
+                <span class="preview-title" id="previewTitle">文件预览</span>
+                <div class="preview-actions">
+                    <button class="icon-btn" id="previewDownloadBtn" title="下载原文件">⬇ 下载</button>
+                    <button class="icon-btn" id="previewCloseBtn" title="关闭预览">✕</button>
+                </div>
+            </div>
+            <div class="preview-body" id="previewBody">
+                <!-- 动态填充图片、音视频或代码 -->
+            </div>
+        </div>
+    </div>
+
+    <!-- 手机扫码互联模态框 -->
+    <div class="modal-overlay" id="qrModal">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <h3>📱 手机扫码极速互联</h3>
+                <button class="modal-close" id="qrModalClose">✕</button>
+            </div>
+            <div class="modal-body qr-modal-content">
+                <div class="qr-code-box" id="modalQrCodeBox">
+                    <!-- 动态生成矢量 SVG 二维码 -->
+                </div>
+                <div class="qr-url-box">
+                    <span id="modalQrUrlText"></span>
+                    <button class="copy-url-btn" id="copyUrlBtn">复制网址</button>
+                </div>
+                <div class="qr-tips">
+                    <p>✓ 确保手机连接同一 Wi-Fi 或路由器</p>
+                    <p>✓ 支持手机相机扫码、微信扫一扫直接秒开</p>
+                    <p>✓ 支持手机相册照片/视频原图免压缩上传</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 通用弹窗 (新建文件夹 / 重命名) -->
+    <div class="modal-overlay" id="promptModal">
+        <div class="modal-dialog prompt-dialog">
+            <div class="modal-header">
+                <h3 id="promptTitle">请输入</h3>
+                <button class="modal-close" id="promptClose">✕</button>
+            </div>
+            <div class="modal-body">
+                <input type="text" id="promptInput" class="prompt-input" autocomplete="off">
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="promptCancelBtn">取消</button>
+                <button class="btn btn-primary" id="promptConfirmBtn">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 确认删除对话框 -->
+    <div class="modal-overlay" id="confirmModal">
+        <div class="modal-dialog prompt-dialog">
+            <div class="modal-header">
+                <h3 id="confirmTitle">确认操作</h3>
+                <button class="modal-close" id="confirmClose">✕</button>
+            </div>
+            <div class="modal-body">
+                <p id="confirmMessage">确定要执行此操作吗？此操作不可逆。</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="confirmCancelBtn">取消</button>
+                <button class="btn btn-danger" id="confirmOkBtn">确认删除</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast 消息通知容器 -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <!-- 隐藏的文件/目录选择器 -->
+    <input type="file" id="hiddenFileInput" multiple style="display:none;">
+    <input type="file" id="hiddenFolderInput" webkitdirectory style="display:none;">
+
+    <!-- 核心驱动脚本 (带版本防缓存戳，保证浏览器秒级加载最新引擎) -->
+    <script src="__ASSETS_PREFIX__qrcode.min.js?v=20261026_lan_ip_fix"></script>
+    <script src="__ASSETS_PREFIX__app.js?v=20261026_lan_ip_fix"></script>
+</body>
+</html>

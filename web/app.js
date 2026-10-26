@@ -1,0 +1,1988 @@
+/**
+ * LAN Fast Share - 现代化网盘级核心应用 (100% 离线原生 ES6+)
+ * 包含: SPA 目录导航、专业级传输任务中心 (流式上传/下载、断点续传、暂停/继续)、
+ * 批量操作坞、多媒体/文本在线预览、纯前端 SVG 二维码生成器与 Toast 提示。
+ */
+
+(function () {
+    'use strict';
+
+    // === 内置纯原生离线二维码算法引擎 (Reed-Solomon 纠错与 SVG 生成) ===
+    /**
+ * @file qrcode.min.js
+ * @brief 纯原生离线二维码生成引擎 (基于经典自包含 QR Code 算法)
+ * @details 100% 离线运行，零外部网络与 CDN 依赖，支持生成高保真矢量 SVG 与 Canvas。
+ */
+(function(global) {
+    // -------------------------------------------------------------------------
+    // 核心数据结构与数学模型 (GF(256) 域与 Reed-Solomon 纠错)
+    // -------------------------------------------------------------------------
+    function QRPolynomial(num, shift) {
+        if (num.length === undefined) throw new Error(num.length + "/" + shift);
+        var offset = 0;
+        while (offset < num.length && num[offset] === 0) offset++;
+        this.num = new Array(num.length - offset + shift);
+        for (var i = 0; i < num.length - offset; i++) this.num[i] = num[i + offset];
+        for (var j = num.length - offset; j < this.num.length; j++) this.num[j] = 0;
+    }
+    QRPolynomial.prototype = {
+        get: function(index) { return this.num[index]; },
+        getLength: function() { return this.num.length; },
+        multiply: function(e) {
+            var num = new Array(this.getLength() + e.getLength() - 1);
+            for (var i = 0; i < num.length; i++) num[i] = 0;
+            for (var i = 0; i < this.getLength(); i++) {
+                for (var j = 0; j < e.getLength(); j++) {
+                    num[i + j] ^= QRMath.gmult(this.get(i), e.get(j));
+                }
+            }
+            return new QRPolynomial(num, 0);
+        },
+        mod: function(e) {
+            if (this.getLength() - e.getLength() < 0) return this;
+            var ratio = QRMath.glog(this.get(0)) - QRMath.glog(e.get(0));
+            var num = new Array(this.getLength());
+            for (var i = 0; i < this.getLength(); i++) num[i] = this.get(i);
+            for (var i = 0; i < e.getLength(); i++) {
+                num[i] ^= QRMath.gexp(QRMath.glog(e.get(i)) + ratio);
+            }
+            return new QRPolynomial(num, 0).mod(e);
+        }
+    };
+
+    var QRMath = {
+        glog: function(n) {
+            if (n < 1) throw new Error("glog(" + n + ")");
+            return QRMath.LOG_TABLE[n];
+        },
+        gexp: function(n) {
+            while (n < 0) n += 255;
+            while (n >= 255) n -= 255;
+            return QRMath.EXP_TABLE[n];
+        },
+        gmult: function(n, m) {
+            if (n === 0 || m === 0) return 0;
+            return QRMath.gexp(QRMath.glog(n) + QRMath.glog(m));
+        },
+        EXP_TABLE: new Array(256),
+        LOG_TABLE: new Array(256)
+    };
+    for (var i = 0; i < 8; i++) QRMath.EXP_TABLE[i] = 1 << i;
+    for (var i = 8; i < 256; i++) QRMath.EXP_TABLE[i] = QRMath.EXP_TABLE[i - 4] ^ QRMath.EXP_TABLE[i - 5] ^ QRMath.EXP_TABLE[i - 6] ^ QRMath.EXP_TABLE[i - 8];
+    for (var i = 0; i < 255; i++) QRMath.LOG_TABLE[QRMath.EXP_TABLE[i]] = i;
+
+    var QRMode = { MODE_NUMBER: 1 << 0, MODE_ALPHA_NUM: 1 << 1, MODE_8BIT_BYTE: 1 << 2, MODE_KANJI: 1 << 3 };
+    var QRErrorCorrectLevel = { L: 1, M: 0, Q: 3, H: 2 };
+    var QRMaskPattern = { PATTERN000: 0, PATTERN001: 1, PATTERN010: 2, PATTERN011: 3, PATTERN100: 4, PATTERN101: 5, PATTERN110: 6, PATTERN111: 7 };
+
+    function QRRSBlock(totalCount, dataCount) {
+        this.totalCount = totalCount;
+        this.dataCount = dataCount;
+    }
+    QRRSBlock.RS_BLOCK_TABLE = [
+        [1, 26, 19], [1, 26, 16], [1, 26, 13], [1, 26, 9],
+        [1, 44, 34], [1, 44, 28], [1, 44, 22], [1, 44, 16],
+        [1, 70, 55], [1, 70, 44], [2, 35, 17], [2, 35, 13],
+        [1, 100, 80], [2, 50, 32], [2, 50, 24], [4, 25, 9],
+        [1, 134, 108], [2, 67, 43], [2, 33, 15, 2, 34, 16], [2, 33, 11, 2, 34, 12],
+        [2, 86, 68], [4, 43, 27], [4, 43, 19], [4, 43, 15],
+        [2, 98, 78], [4, 49, 31], [2, 32, 14, 4, 33, 15], [4, 39, 13, 1, 40, 14],
+        [2, 121, 97], [2, 60, 38, 2, 61, 39], [4, 40, 18, 2, 41, 19], [4, 40, 14, 2, 41, 15],
+        [2, 146, 116], [3, 58, 36, 2, 59, 37], [4, 36, 16, 4, 37, 17], [4, 36, 12, 4, 37, 13],
+        [2, 86, 68, 2, 87, 69], [4, 69, 43, 1, 70, 44], [6, 43, 19, 2, 44, 20], [6, 43, 15, 2, 44, 16]
+    ];
+    QRRSBlock.getRSBlocks = function(typeNumber, errorCorrectLevel) {
+        var rsBlock = QRRSBlock.getRsBlockTable(typeNumber, errorCorrectLevel);
+        if (rsBlock === undefined) throw new Error("bad rs block @ typeNumber:" + typeNumber + "/errorCorrectLevel:" + errorCorrectLevel);
+        var length = rsBlock.length / 3;
+        var list = [];
+        for (var i = 0; i < length; i++) {
+            var count = rsBlock[i * 3 + 0];
+            var totalCount = rsBlock[i * 3 + 1];
+            var dataCount = rsBlock[i * 3 + 2];
+            for (var j = 0; j < count; j++) list.push(new QRRSBlock(totalCount, dataCount));
+        }
+        return list;
+    };
+    QRRSBlock.getRsBlockTable = function(typeNumber, errorCorrectLevel) {
+        switch (errorCorrectLevel) {
+            case QRErrorCorrectLevel.L: return QRRSBlock.RS_BLOCK_TABLE[(typeNumber - 1) * 4 + 0];
+            case QRErrorCorrectLevel.M: return QRRSBlock.RS_BLOCK_TABLE[(typeNumber - 1) * 4 + 1];
+            case QRErrorCorrectLevel.Q: return QRRSBlock.RS_BLOCK_TABLE[(typeNumber - 1) * 4 + 2];
+            case QRErrorCorrectLevel.H: return QRRSBlock.RS_BLOCK_TABLE[(typeNumber - 1) * 4 + 3];
+            default: return undefined;
+        }
+    };
+
+    function QRBitBuffer() {
+        this.buffer = [];
+        this.length = 0;
+    }
+    QRBitBuffer.prototype = {
+        get: function(index) {
+            var bufIndex = Math.floor(index / 8);
+            return ((this.buffer[bufIndex] >>> (7 - index % 8)) & 1) === 1;
+        },
+        put: function(num, length) {
+            for (var i = 0; i < length; i++) {
+                this.putBit(((num >>> (length - i - 1)) & 1) === 1);
+            }
+        },
+        getLengthInBits: function() { return this.length; },
+        putBit: function(bit) {
+            var bufIndex = Math.floor(this.length / 8);
+            if (this.buffer.length <= bufIndex) this.buffer.push(0);
+            if (bit) this.buffer[bufIndex] |= (0x80 >>> (this.length % 8));
+            this.length++;
+        }
+    };
+
+    function QR8bitByte(data) {
+        this.mode = QRMode.MODE_8BIT_BYTE;
+        this.data = data;
+        this.parsedData = [];
+        // UTF-8 编码转换
+        for (var i = 0, l = this.data.length; i < l; i++) {
+            var byteArray = [];
+            var code = this.data.charCodeAt(i);
+            if (code > 0x10000) {
+                byteArray[0] = 0xF0 | ((code & 0x1C0000) >>> 18);
+                byteArray[1] = 0x80 | ((code & 0x3F000) >>> 12);
+                byteArray[2] = 0x80 | ((code & 0xFC0) >>> 6);
+                byteArray[3] = 0x80 | (code & 0x3F);
+            } else if (code > 0x800) {
+                byteArray[0] = 0xE0 | ((code & 0xF000) >>> 12);
+                byteArray[1] = 0x80 | ((code & 0xFC0) >>> 6);
+                byteArray[2] = 0x80 | (code & 0x3F);
+            } else if (code > 0x7F) {
+                byteArray[0] = 0xC0 | ((code & 0x7C0) >>> 6);
+                byteArray[1] = 0x80 | (code & 0x3F);
+            } else {
+                byteArray[0] = code;
+            }
+            this.parsedData.push(byteArray);
+        }
+        this.parsedData = Array.prototype.concat.apply([], this.parsedData);
+    }
+    QR8bitByte.prototype = {
+        getLength: function() { return this.parsedData.length; },
+        write: function(buffer) {
+            for (var i = 0, l = this.parsedData.length; i < l; i++) {
+                buffer.put(this.parsedData[i], 8);
+            }
+        }
+    };
+
+    function QRCodeModel(typeNumber, errorCorrectLevel) {
+        this.typeNumber = typeNumber;
+        this.errorCorrectLevel = errorCorrectLevel;
+        this.modules = null;
+        this.moduleCount = 0;
+        this.dataCache = null;
+        this.dataList = [];
+    }
+    QRCodeModel.prototype = {
+        addData: function(data) {
+            var newData = new QR8bitByte(data);
+            this.dataList.push(newData);
+            this.dataCache = null;
+        },
+        isDark: function(row, col) {
+            if (row < 0 || this.moduleCount <= row || col < 0 || this.moduleCount <= col) {
+                throw new Error(row + "," + col);
+            }
+            return this.modules[row][col];
+        },
+        getModuleCount: function() { return this.moduleCount; },
+        make: function() {
+            if (this.typeNumber < 1) {
+                var typeNumber = 1;
+                for (typeNumber = 1; typeNumber < 40; typeNumber++) {
+                    var rsBlocks = QRRSBlock.getRSBlocks(typeNumber, this.errorCorrectLevel);
+                    var buffer = new QRBitBuffer();
+                    var totalDataCount = 0;
+                    for (var i = 0; i < rsBlocks.length; i++) totalDataCount += rsBlocks[i].dataCount;
+                    for (var i = 0; i < this.dataList.length; i++) {
+                        var data = this.dataList[i];
+                        buffer.put(data.mode, 4);
+                        buffer.put(data.getLength(), QRCodeUtil.getLengthInBits(data.mode, typeNumber));
+                        data.write(buffer);
+                    }
+                    if (buffer.getLengthInBits() <= totalDataCount * 8) break;
+                }
+                this.typeNumber = typeNumber;
+            }
+            this.makeImpl(false, this.getBestMaskPattern());
+        },
+        makeImpl: function(test, maskPattern) {
+            this.moduleCount = this.typeNumber * 4 + 17;
+            this.modules = new Array(this.moduleCount);
+            for (var row = 0; row < this.moduleCount; row++) {
+                this.modules[row] = new Array(this.moduleCount);
+                for (var col = 0; col < this.moduleCount; col++) this.modules[row][col] = null;
+            }
+            this.setupPositionProbePattern(0, 0);
+            this.setupPositionProbePattern(this.moduleCount - 7, 0);
+            this.setupPositionProbePattern(0, this.moduleCount - 7);
+            this.setupPositionAdjustPattern();
+            this.setupTimingPattern();
+            this.setupTypeInfo(test, maskPattern);
+            if (this.typeNumber >= 7) this.setupTypeNumber(test);
+            if (this.dataCache === null) {
+                this.dataCache = QRCodeModel.createData(this.typeNumber, this.errorCorrectLevel, this.dataList);
+            }
+            this.mapData(this.dataCache, maskPattern);
+        },
+        setupPositionProbePattern: function(row, col) {
+            for (var r = -1; r <= 7; r++) {
+                if (row + r <= -1 || this.moduleCount <= row + r) continue;
+                for (var c = -1; c <= 7; c++) {
+                    if (col + c <= -1 || this.moduleCount <= col + c) continue;
+                    if ((0 <= r && r <= 6 && (c === 0 || c === 6)) || (0 <= c && c <= 6 && (r === 0 || r === 6)) || (2 <= r && r <= 4 && 2 <= c && c <= 4)) {
+                        this.modules[row + r][col + c] = true;
+                    } else {
+                        this.modules[row + r][col + c] = false;
+                    }
+                }
+            }
+        },
+        getBestMaskPattern: function() {
+            var minLostPoint = 0;
+            var pattern = 0;
+            for (var i = 0; i < 8; i++) {
+                this.makeImpl(true, i);
+                var lostPoint = QRCodeUtil.getLostPoint(this);
+                if (i === 0 || minLostPoint > lostPoint) {
+                    minLostPoint = lostPoint;
+                    pattern = i;
+                }
+            }
+            return pattern;
+        },
+        setupTimingPattern: function() {
+            for (var r = 8; r < this.moduleCount - 8; r++) {
+                if (this.modules[r][6] !== null) continue;
+                this.modules[r][6] = (r % 2 === 0);
+            }
+            for (var c = 8; c < this.moduleCount - 8; c++) {
+                if (this.modules[6][c] !== null) continue;
+                this.modules[6][c] = (c % 2 === 0);
+            }
+        },
+        setupPositionAdjustPattern: function() {
+            var pos = QRCodeUtil.getPatternPosition(this.typeNumber);
+            for (var i = 0; i < pos.length; i++) {
+                for (var j = 0; j < pos.length; j++) {
+                    var row = pos[i];
+                    var col = pos[j];
+                    if (this.modules[row][col] !== null) continue;
+                    for (var r = -2; r <= 2; r++) {
+                        for (var c = -2; c <= 2; c++) {
+                            if (r === -2 || r === 2 || c === -2 || c === 2 || (r === 0 && c === 0)) {
+                                this.modules[row + r][col + c] = true;
+                            } else {
+                                this.modules[row + r][col + c] = false;
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        setupTypeNumber: function(test) {
+            var bits = QRCodeUtil.getBCHTypeNumber(this.typeNumber);
+            for (var i = 0; i < 18; i++) {
+                var mod = (!test && ((bits >> i) & 1) === 1);
+                this.modules[Math.floor(i / 3)][i % 3 + this.moduleCount - 8 - 3] = mod;
+            }
+            for (var i = 0; i < 18; i++) {
+                var mod = (!test && ((bits >> i) & 1) === 1);
+                this.modules[i % 3 + this.moduleCount - 8 - 3][Math.floor(i / 3)] = mod;
+            }
+        },
+        setupTypeInfo: function(test, maskPattern) {
+            var data = (this.errorCorrectLevel << 3) | maskPattern;
+            var bits = QRCodeUtil.getBCHTypeInfo(data);
+            for (var i = 0; i < 15; i++) {
+                var mod = (!test && ((bits >> i) & 1) === 1);
+                if (i < 6) {
+                    this.modules[i][8] = mod;
+                } else if (i < 8) {
+                    this.modules[i + 1][8] = mod;
+                } else {
+                    this.modules[this.moduleCount - 15 + i][8] = mod;
+                }
+            }
+            for (var i = 0; i < 15; i++) {
+                var mod = (!test && ((bits >> i) & 1) === 1);
+                if (i < 8) {
+                    this.modules[8][this.moduleCount - i - 1] = mod;
+                } else if (i < 9) {
+                    this.modules[8][15 - i - 1 + 1] = mod;
+                } else {
+                    this.modules[8][15 - i - 1] = mod;
+                }
+            }
+            this.modules[this.moduleCount - 8][8] = (!test);
+        },
+        mapData: function(data, maskPattern) {
+            var inc = -1;
+            var row = this.moduleCount - 1;
+            var bitIndex = 7;
+            var byteIndex = 0;
+            var maskFunc = QRCodeUtil.getMaskFunction(maskPattern);
+            for (var col = this.moduleCount - 1; col > 0; col -= 2) {
+                if (col === 6) col--;
+                while (true) {
+                    for (var c = 0; c < 2; c++) {
+                        if (this.modules[row][col - c] === null) {
+                            var dark = false;
+                            if (byteIndex < data.length) {
+                                dark = (((data[byteIndex] >>> bitIndex) & 1) === 1);
+                            }
+                            var mask = maskFunc(row, col - c);
+                            if (mask) dark = !dark;
+                            this.modules[row][col - c] = dark;
+                            bitIndex--;
+                            if (bitIndex === -1) {
+                                byteIndex++;
+                                bitIndex = 7;
+                            }
+                        }
+                    }
+                    row += inc;
+                    if (row < 0 || this.moduleCount <= row) {
+                        row -= inc;
+                        inc = -inc;
+                        break;
+                    }
+                }
+            }
+        }
+    };
+
+    QRCodeModel.createData = function(typeNumber, errorCorrectLevel, dataList) {
+        var rsBlocks = QRRSBlock.getRSBlocks(typeNumber, errorCorrectLevel);
+        var buffer = new QRBitBuffer();
+        for (var i = 0; i < dataList.length; i++) {
+            var data = dataList[i];
+            buffer.put(data.mode, 4);
+            buffer.put(data.getLength(), QRCodeUtil.getLengthInBits(data.mode, typeNumber));
+            data.write(buffer);
+        }
+        var totalDataCount = 0;
+        for (var i = 0; i < rsBlocks.length; i++) totalDataCount += rsBlocks[i].dataCount;
+        if (buffer.getLengthInBits() > totalDataCount * 8) {
+            throw new Error("code length overflow. (" + buffer.getLengthInBits() + ">" + totalDataCount * 8 + ")");
+        }
+        if (buffer.getLengthInBits() + 4 <= totalDataCount * 8) buffer.put(0, 4);
+        while (buffer.getLengthInBits() % 8 !== 0) buffer.putBit(false);
+        while (true) {
+            if (buffer.getLengthInBits() >= totalDataCount * 8) break;
+            buffer.put(0xEC, 8);
+            if (buffer.getLengthInBits() >= totalDataCount * 8) break;
+            buffer.put(0x11, 8);
+        }
+        return QRCodeModel.createBytes(buffer, rsBlocks);
+    };
+
+    QRCodeModel.createBytes = function(buffer, rsBlocks) {
+        var offset = 0;
+        var maxDcCount = 0;
+        var maxEcCount = 0;
+        var dcdata = new Array(rsBlocks.length);
+        var ecdata = new Array(rsBlocks.length);
+        for (var r = 0; r < rsBlocks.length; r++) {
+            var dcCount = rsBlocks[r].dataCount;
+            var ecCount = rsBlocks[r].totalCount - dcCount;
+            maxDcCount = Math.max(maxDcCount, dcCount);
+            maxEcCount = Math.max(maxEcCount, ecCount);
+            dcdata[r] = new Array(dcCount);
+            for (var i = 0; i < dcdata[r].length; i++) dcdata[r][i] = 0xFF & buffer.buffer[i + offset];
+            offset += dcCount;
+            var rsPoly = QRCodeUtil.getErrorCorrectPolynomial(ecCount);
+            var rawPoly = new QRPolynomial(dcdata[r], rsPoly.getLength() - 1);
+            var modPoly = rawPoly.mod(rsPoly);
+            ecdata[r] = new Array(rsPoly.getLength() - 1);
+            for (var i = 0; i < ecdata[r].length; i++) {
+                var modIndex = i + modPoly.getLength() - ecdata[r].length;
+                ecdata[r][i] = (modIndex >= 0) ? modPoly.get(modIndex) : 0;
+            }
+        }
+        var totalCodeCount = 0;
+        for (var i = 0; i < rsBlocks.length; i++) totalCodeCount += rsBlocks[i].totalCount;
+        var data = new Array(totalCodeCount);
+        var index = 0;
+        for (var i = 0; i < maxDcCount; i++) {
+            for (var r = 0; r < rsBlocks.length; r++) {
+                if (i < dcdata[r].length) data[index++] = dcdata[r][i];
+            }
+        }
+        for (var i = 0; i < maxEcCount; i++) {
+            for (var r = 0; r < rsBlocks.length; r++) {
+                if (i < ecdata[r].length) data[index++] = ecdata[r][i];
+            }
+        }
+        return data;
+    };
+
+    var QRCodeUtil = {
+        PATTERN_POSITION_TABLE: [
+            [], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34],
+            [6, 22, 38], [6, 24, 42], [6, 26, 46], [6, 28, 50], [6, 30, 54],
+            [6, 32, 58], [6, 34, 62], [6, 26, 46, 66], [6, 26, 48, 70],
+            [6, 26, 50, 74], [6, 30, 54, 78], [6, 30, 56, 82], [6, 30, 58, 86],
+            [6, 34, 62, 90], [6, 28, 50, 72, 94], [6, 26, 50, 74, 98],
+            [6, 30, 54, 78, 102], [6, 28, 54, 80, 106], [6, 32, 58, 84, 110],
+            [6, 30, 58, 86, 114], [6, 34, 62, 90, 118], [6, 26, 50, 74, 98, 122],
+            [6, 30, 54, 78, 102, 126], [6, 26, 52, 78, 104, 130], [6, 30, 56, 82, 108, 134],
+            [6, 34, 60, 86, 112, 138], [6, 30, 58, 86, 114, 142], [6, 34, 62, 90, 118, 146],
+            [6, 30, 54, 78, 102, 126, 150], [6, 24, 50, 76, 102, 128, 154],
+            [6, 28, 54, 80, 106, 132, 158], [6, 32, 58, 84, 110, 136, 162],
+            [6, 26, 54, 82, 110, 138, 166], [6, 30, 58, 86, 114, 142, 170]
+        ],
+        G15: (1 << 10) | (1 << 8) | (1 << 5) | (1 << 4) | (1 << 2) | (1 << 1) | (1 << 0),
+        G18: (1 << 12) | (1 << 11) | (1 << 10) | (1 << 9) | (1 << 8) | (1 << 5) | (1 << 2) | (1 << 0),
+        G15_MASK: (1 << 14) | (1 << 12) | (1 << 10) | (1 << 4) | (1 << 1),
+        getBCHTypeInfo: function(data) {
+            var d = data << 10;
+            while (QRCodeUtil.getBCHDigit(d) - QRCodeUtil.getBCHDigit(QRCodeUtil.G15) >= 0) {
+                d ^= (QRCodeUtil.G15 << (QRCodeUtil.getBCHDigit(d) - QRCodeUtil.getBCHDigit(QRCodeUtil.G15)));
+            }
+            return ((data << 10) | d) ^ QRCodeUtil.G15_MASK;
+        },
+        getBCHTypeNumber: function(data) {
+            var d = data << 12;
+            while (QRCodeUtil.getBCHDigit(d) - QRCodeUtil.getBCHDigit(QRCodeUtil.G18) >= 0) {
+                d ^= (QRCodeUtil.G18 << (QRCodeUtil.getBCHDigit(d) - QRCodeUtil.getBCHDigit(QRCodeUtil.G18)));
+            }
+            return (data << 12) | d;
+        },
+        getBCHDigit: function(data) {
+            var digit = 0;
+            while (data !== 0) {
+                digit++;
+                data >>>= 1;
+            }
+            return digit;
+        },
+        getPatternPosition: function(typeNumber) {
+            return QRCodeUtil.PATTERN_POSITION_TABLE[typeNumber - 1];
+        },
+        getMaskFunction: function(maskPattern) {
+            switch (maskPattern) {
+                case QRMaskPattern.PATTERN000: return function(i, j) { return (i + j) % 2 === 0; };
+                case QRMaskPattern.PATTERN001: return function(i, j) { return i % 2 === 0; };
+                case QRMaskPattern.PATTERN010: return function(i, j) { return j % 3 === 0; };
+                case QRMaskPattern.PATTERN011: return function(i, j) { return (i + j) % 3 === 0; };
+                case QRMaskPattern.PATTERN100: return function(i, j) { return (Math.floor(i / 2) + Math.floor(j / 3)) % 2 === 0; };
+                case QRMaskPattern.PATTERN101: return function(i, j) { return (i * j) % 2 + (i * j) % 3 === 0; };
+                case QRMaskPattern.PATTERN110: return function(i, j) { return ((i * j) % 2 + (i * j) % 3) % 2 === 0; };
+                case QRMaskPattern.PATTERN111: return function(i, j) { return ((i * j) % 3 + (i + j) % 2) % 2 === 0; };
+                default: throw new Error("bad maskPattern:" + maskPattern);
+            }
+        },
+        getErrorCorrectPolynomial: function(errorCorrectLength) {
+            var a = new QRPolynomial([1], 0);
+            for (var i = 0; i < errorCorrectLength; i++) {
+                a = a.multiply(new QRPolynomial([1, QRMath.gexp(i)], 0));
+            }
+            return a;
+        },
+        getLengthInBits: function(mode, type) {
+            if (1 <= type && type < 10) {
+                switch (mode) {
+                    case QRMode.MODE_NUMBER: return 10;
+                    case QRMode.MODE_ALPHA_NUM: return 9;
+                    case QRMode.MODE_8BIT_BYTE: return 8;
+                    case QRMode.MODE_KANJI: return 8;
+                    default: throw new Error("mode:" + mode);
+                }
+            } else if (type < 27) {
+                switch (mode) {
+                    case QRMode.MODE_NUMBER: return 12;
+                    case QRMode.MODE_ALPHA_NUM: return 11;
+                    case QRMode.MODE_8BIT_BYTE: return 16;
+                    case QRMode.MODE_KANJI: return 10;
+                    default: throw new Error("mode:" + mode);
+                }
+            } else if (type < 41) {
+                switch (mode) {
+                    case QRMode.MODE_NUMBER: return 14;
+                    case QRMode.MODE_ALPHA_NUM: return 13;
+                    case QRMode.MODE_8BIT_BYTE: return 16;
+                    case QRMode.MODE_KANJI: return 12;
+                    default: throw new Error("mode:" + mode);
+                }
+            } else {
+                throw new Error("type:" + type);
+            }
+        },
+        getLostPoint: function(qrCode) {
+            var moduleCount = qrCode.getModuleCount();
+            var lostPoint = 0;
+            // 等级评估函数
+            for (var row = 0; row < moduleCount; row++) {
+                for (var col = 0; col < moduleCount; col++) {
+                    var sameCount = 0;
+                    var dark = qrCode.isDark(row, col);
+                    for (var r = -1; r <= 1; r++) {
+                        if (row + r < 0 || moduleCount <= row + r) continue;
+                        for (var c = -1; c <= 1; c++) {
+                            if (col + c < 0 || moduleCount <= col + c || (r === 0 && c === 0)) continue;
+                            if (dark === qrCode.isDark(row + r, col + c)) sameCount++;
+                        }
+                    }
+                    if (sameCount > 5) lostPoint += (3 + sameCount - 5);
+                }
+            }
+            return lostPoint;
+        }
+    };
+
+    /**
+     * @brief 纯离线高阶导出类：生成标准纯矢量 SVG 二维码
+     * @param {string} text 需要编码的 URL 或文本
+     * @param {Object} options 配置选项 { margin: 4, size: 220, level: 'M' }
+     * @return {string} 完整的标准 SVG 标签字符串
+     */
+    function createQrSvg(text, options) {
+        options = options || {};
+        var margin = typeof options.margin === 'number' ? options.margin : 4; // ISO标准静区
+        var size = options.size || 220;
+        var level = QRErrorCorrectLevel[options.level || 'M'];
+
+        var qr = new QRCodeModel(0, level);
+        qr.addData(text);
+        qr.make();
+
+        var count = qr.getModuleCount();
+        var totalModules = count + margin * 2;
+        var rects = [];
+
+        for (var r = 0; r < count; r++) {
+            for (var c = 0; c < count; c++) {
+                if (qr.isDark(r, c)) {
+                    rects.push('<rect x="' + (c + margin) + '" y="' + (r + margin) + '" width="1" height="1" fill="#000000"/>');
+                }
+            }
+        }
+
+        return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + totalModules + ' ' + totalModules + '" width="' + size + '" height="' + size + '" shape-rendering="crispEdges" style="display:block;margin:0 auto;background:#ffffff;">' +
+            '<rect width="' + totalModules + '" height="' + totalModules + '" fill="#ffffff"/>' +
+            rects.join('') +
+            '</svg>';
+    }
+
+    // 挂载到全局
+    global.LanQRCode = {
+        createSvg: createQrSvg,
+        QRCodeModel: QRCodeModel,
+        QRErrorCorrectLevel: QRErrorCorrectLevel
+    };
+})(typeof window !== 'undefined' ? window : this);
+
+
+
+    // ==========================================================================
+    // 1. 全局状态 (App State)
+    // ==========================================================================
+    const state = {
+        currentPath: '/',
+        uriPrefix: '/',
+        allowUpload: true,
+        allowDelete: true,
+        allowSearch: true,
+        allowArchive: true,
+        items: [],          // 当前目录全部原始项目
+        filteredItems: [],  // 搜索和排序后的项目
+        selectedPaths: new Set(),
+        lastSelectedIndex: -1,
+        viewMode: localStorage.getItem('lan_view_mode') || 'list',
+        sortBy: localStorage.getItem('lan_sort_by') || 'name-asc',
+        theme: localStorage.getItem('lan_theme') || 'light'
+    };
+
+    // ==========================================================================
+    // 2. 辅助工具函数 (Utilities)
+    // ==========================================================================
+    function formatBytes(bytes) {
+        if (!bytes || bytes <= 0) return '0 B';
+        const k = 1024;
+        const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    }
+
+    function formatSpeed(bytesPerSec) {
+        if (!bytesPerSec || bytesPerSec <= 0) return '0.0 MB/s';
+        const mb = bytesPerSec / (1024 * 1024);
+        if (mb >= 1) return mb.toFixed(1) + ' MB/s';
+        const kb = bytesPerSec / 1024;
+        return kb.toFixed(1) + ' KB/s';
+    }
+
+    function formatTime(timestamp) {
+        if (!timestamp) return '-';
+        const d = new Date(timestamp);
+        const pad = (n) => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+
+    function formatETA(seconds) {
+        if (!seconds || seconds <= 0 || !isFinite(seconds)) return '--:--';
+        const s = Math.floor(seconds);
+        const m = Math.floor(s / 60);
+        const sec = s % 60;
+        return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+    }
+
+    function normalizePath(path) {
+        if (!path) return '/';
+        let p = path.replace(/\/+/g, '/');
+        if (!p.startsWith('/')) p = '/' + p;
+        if (p.length > 1 && p.endsWith('/')) p = p.slice(0, -1);
+        return p;
+    }
+
+    function getFileExtension(filename) {
+        const idx = filename.lastIndexOf('.');
+        return idx !== -1 ? filename.slice(idx + 1).toLowerCase() : '';
+    }
+
+    function getFileIcon(item) {
+        if (item.path_type === 'Dir' || item.path_type === 'SymlinkDir') {
+            return '📁';
+        }
+        const ext = getFileExtension(item.name);
+        const imgExts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'ico'];
+        const videoExts = ['mp4', 'webm', 'ogg', 'mov', 'mkv', 'avi'];
+        const audioExts = ['mp3', 'wav', 'flac', 'aac', 'm4a'];
+        const archiveExts = ['zip', 'rar', '7z', 'tar', 'gz'];
+        const codeExts = ['js', 'html', 'css', 'json', 'py', 'c', 'h', 'cpp', 'rs', 'bat', 'sh'];
+        const docExts = ['pdf', 'doc', 'docx', 'txt', 'md'];
+
+        if (imgExts.includes(ext)) return '🖼️';
+        if (videoExts.includes(ext)) return '🎬';
+        if (audioExts.includes(ext)) return '🎵';
+        if (archiveExts.includes(ext)) return '📦';
+        if (codeExts.includes(ext)) return '📝';
+        if (docExts.includes(ext)) return '📄';
+        return '📄';
+    }
+
+    function isImageFile(filename) {
+        return ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'ico'].includes(getFileExtension(filename));
+    }
+    function isMediaFile(filename) {
+        const ext = getFileExtension(filename);
+        return ['mp4', 'webm', 'ogg', 'mov', 'mp3', 'wav', 'flac'].includes(ext);
+    }
+    function isTextFile(filename) {
+        const ext = getFileExtension(filename);
+        return ['txt', 'md', 'json', 'js', 'css', 'html', 'py', 'c', 'h', 'cpp', 'rs', 'sh', 'bat', 'log', 'yml', 'yaml'].includes(ext);
+    }
+
+    // ==========================================================================
+    // 3. 轻提示系统 (Toast Notification)
+    // ==========================================================================
+    function showToast(message, type = 'info', duration = 3000) {
+        const container = document.getElementById('toastContainer');
+        const toast = document.createElement('div');
+        toast.className = `toast ${type}`;
+        const icons = { info: 'ℹ️', success: '✅', error: '❌' };
+        toast.innerHTML = `<span>${icons[type] || 'ℹ️'}</span><span>${escapeHtml(message)}</span>`;
+        container.appendChild(toast);
+
+        setTimeout(() => {
+            toast.style.opacity = '0';
+            toast.style.transform = 'translateY(-10px)';
+            setTimeout(() => toast.remove(), 250);
+        }, duration);
+    }
+
+    function escapeHtml(str) {
+        if (!str) return '';
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+    }
+
+    // ==========================================================================
+    // 4. 传输任务中心引擎 (Transfer Manager)
+    // ==========================================================================
+    class UploadTask {
+        constructor(file, targetDir) {
+            this.id = 'up_' + Math.random().toString(36).substring(2, 10);
+            this.file = file;
+            this.targetDir = targetDir;
+            this.filename = file.name;
+            this.targetUrl = (targetDir === '/' ? '' : targetDir) + '/' + encodeURIComponent(this.filename);
+            this.totalBytes = file.size;
+            this.uploadedBytes = 0;
+            this.serverOffset = 0;
+            this.status = 'pending'; // pending, running, paused, completed, error
+            this.speed = 0;
+            this.eta = 0;
+            this.errorMessage = '';
+            this.xhr = null;
+            this.lastTime = 0;
+            this.lastLoaded = 0;
+        }
+
+        start() {
+            if (this.status === 'running') return;
+            this.status = 'running';
+            this.errorMessage = '';
+            this.lastTime = performance.now();
+            this.lastLoaded = this.uploadedBytes;
+
+            // 1. 探针 HEAD 查询服务器当前已落盘大小，支持智能断点续传
+            const headXhr = new XMLHttpRequest();
+            headXhr.open('HEAD', this.targetUrl, true);
+            headXhr.onload = () => {
+                let existingSize = 0;
+                if (headXhr.status >= 200 && headXhr.status < 300) {
+                    const cl = headXhr.getResponseHeader('Content-Length');
+                    if (cl) existingSize = parseInt(cl, 10) || 0;
+                }
+                // 若服务端已完整拥有此文件，直接标记完成
+                if (existingSize >= this.totalBytes) {
+                    this.uploadedBytes = this.totalBytes;
+                    this.status = 'completed';
+                    TransferManager.onTaskUpdated();
+                    TransferManager.triggerDirectoryRefresh();
+                    return;
+                }
+                this.serverOffset = existingSize;
+                this.uploadedBytes = existingSize;
+                this.executeTransfer();
+            };
+            headXhr.onerror = () => {
+                this.serverOffset = 0;
+                this.executeTransfer();
+            };
+            headXhr.send();
+        }
+
+        executeTransfer() {
+            if (this.status !== 'running') return;
+            this.xhr = new XMLHttpRequest();
+
+            // 若 offset > 0 则通过 PATCH 追加上传；否则通过首次 PUT 上传
+            const isAppend = this.serverOffset > 0;
+            const method = isAppend ? 'PATCH' : 'PUT';
+            const sliceData = isAppend ? this.file.slice(this.serverOffset) : this.file;
+
+            this.xhr.open(method, this.targetUrl, true);
+            if (isAppend) {
+                this.xhr.setRequestHeader('X-Update-Range', 'append');
+            }
+
+            this.xhr.upload.onprogress = (e) => {
+                if (this.status !== 'running') return;
+                const currentLoaded = this.serverOffset + e.loaded;
+                this.uploadedBytes = Math.min(currentLoaded, this.totalBytes);
+
+                // EWMA 实时速率计算
+                const now = performance.now();
+                const dt = (now - this.lastTime) / 1000;
+                if (dt >= 0.25) {
+                    const dBytes = currentLoaded - this.lastLoaded;
+                    const instantSpeed = dBytes / dt;
+                    this.speed = this.speed === 0 ? instantSpeed : this.speed * 0.65 + instantSpeed * 0.35;
+                    this.lastTime = now;
+                    this.lastLoaded = currentLoaded;
+                    const remaining = this.totalBytes - this.uploadedBytes;
+                    this.eta = this.speed > 0 ? remaining / this.speed : 0;
+                }
+                TransferManager.onTaskUpdated();
+            };
+
+            this.xhr.onload = () => {
+                if (this.xhr.status >= 200 && this.xhr.status < 300) {
+                    this.uploadedBytes = this.totalBytes;
+                    this.status = 'completed';
+                    this.speed = 0;
+                    this.eta = 0;
+                    TransferManager.onTaskUpdated();
+                    TransferManager.triggerDirectoryRefresh();
+                    TransferManager.scheduleNext();
+                } else {
+                    this.status = 'error';
+                    this.errorMessage = `HTTP ${this.xhr.status}`;
+                    TransferManager.onTaskUpdated();
+                    TransferManager.scheduleNext();
+                }
+            };
+
+            this.xhr.onerror = () => {
+                if (this.status === 'paused') return;
+                this.status = 'error';
+                this.errorMessage = '网络连接中断';
+                TransferManager.onTaskUpdated();
+                TransferManager.scheduleNext();
+            };
+
+            this.xhr.onabort = () => {
+                this.speed = 0;
+                this.eta = 0;
+                TransferManager.onTaskUpdated();
+            };
+
+            this.xhr.send(sliceData);
+        }
+
+        pause() {
+            if (this.status !== 'running') return;
+            this.status = 'paused';
+            if (this.xhr) {
+                this.xhr.abort();
+                this.xhr = null;
+            }
+            this.speed = 0;
+            this.eta = 0;
+            TransferManager.onTaskUpdated();
+            TransferManager.scheduleNext();
+        }
+
+        resume() {
+            if (this.status === 'paused' || this.status === 'error') {
+                this.start();
+            }
+        }
+
+        cancel() {
+            if (this.xhr) {
+                this.xhr.abort();
+                this.xhr = null;
+            }
+            TransferManager.removeUploadTask(this.id);
+        }
+    }
+
+    class DownloadTask {
+        constructor(filename, fileUrl, totalBytes) {
+            this.id = 'down_' + Math.random().toString(36).substring(2, 10);
+            this.filename = filename;
+            this.fileUrl = fileUrl;
+            this.totalBytes = totalBytes || 0;
+            this.receivedBytes = 0;
+            this.chunks = [];
+            this.status = 'pending'; // pending, running, paused, completed, error
+            this.speed = 0;
+            this.eta = 0;
+            this.errorMessage = '';
+            this.abortController = null;
+            this.lastTime = 0;
+            this.lastLoaded = 0;
+        }
+
+        async start() {
+            if (this.status === 'running') return;
+            this.status = 'running';
+            this.errorMessage = '';
+            this.abortController = new AbortController();
+            this.lastTime = performance.now();
+            this.lastLoaded = this.receivedBytes;
+
+            const headers = {};
+            if (this.receivedBytes > 0) {
+                headers['Range'] = `bytes=${this.receivedBytes}-`;
+            }
+
+            try {
+                const response = await fetch(this.fileUrl, {
+                    headers: headers,
+                    signal: this.abortController.signal
+                });
+
+                if (!response.ok && response.status !== 206) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                if (response.status === 200 && this.receivedBytes > 0) {
+                    // 服务端不支持 Range，降级重传
+                    this.chunks = [];
+                    this.receivedBytes = 0;
+                }
+
+                if (!this.totalBytes) {
+                    const cl = response.headers.get('Content-Length');
+                    if (cl) this.totalBytes = parseInt(cl, 10) || 0;
+                }
+
+                const reader = response.body.getReader();
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    this.chunks.push(value);
+                    this.receivedBytes += value.length;
+
+                    // EWMA 速率计算
+                    const now = performance.now();
+                    const dt = (now - this.lastTime) / 1000;
+                    if (dt >= 0.25) {
+                        const dBytes = this.receivedBytes - this.lastLoaded;
+                        const instantSpeed = dBytes / dt;
+                        this.speed = this.speed === 0 ? instantSpeed : this.speed * 0.65 + instantSpeed * 0.35;
+                        this.lastTime = now;
+                        this.lastLoaded = this.receivedBytes;
+                        if (this.totalBytes > this.receivedBytes) {
+                            this.eta = this.speed > 0 ? (this.totalBytes - this.receivedBytes) / this.speed : 0;
+                        }
+                    }
+                    TransferManager.onTaskUpdated();
+                }
+
+                // 下载全部完成，生成 Blob 落盘
+                this.status = 'completed';
+                this.speed = 0;
+                this.eta = 0;
+                const blob = new Blob(this.chunks);
+                const blobUrl = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = blobUrl;
+                a.download = this.filename;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
+
+                showToast(`已成功下载: ${this.filename}`, 'success');
+                TransferManager.onTaskUpdated();
+                TransferManager.scheduleNext();
+            } catch (err) {
+                if (err.name === 'AbortError') {
+                    // 用户暂停
+                    this.status = 'paused';
+                } else {
+                    this.status = 'error';
+                    this.errorMessage = err.message || '网络连接失败';
+                    showToast(`下载失败: ${this.filename}`, 'error');
+                }
+                this.speed = 0;
+                this.eta = 0;
+                TransferManager.onTaskUpdated();
+                TransferManager.scheduleNext();
+            }
+        }
+
+        pause() {
+            if (this.status !== 'running') return;
+            if (this.abortController) {
+                this.abortController.abort();
+                this.abortController = null;
+            }
+            this.status = 'paused';
+            this.speed = 0;
+            this.eta = 0;
+            TransferManager.onTaskUpdated();
+            TransferManager.scheduleNext();
+        }
+
+        resume() {
+            if (this.status === 'paused' || this.status === 'error') {
+                this.start();
+            }
+        }
+
+        cancel() {
+            if (this.abortController) {
+                this.abortController.abort();
+                this.abortController = null;
+            }
+            this.chunks = [];
+            TransferManager.removeDownloadTask(this.id);
+        }
+    }
+
+    const TransferManager = {
+        uploadTasks: [],
+        downloadTasks: [],
+        maxConcurrent: 3,
+
+        addUploadFiles(files, targetDir) {
+            for (const file of files) {
+                const task = new UploadTask(file, targetDir || state.currentPath);
+                this.uploadTasks.push(task);
+            }
+            this.scheduleNext();
+            this.openDrawer('upload');
+            showToast(`已添加 ${files.length} 个文件至上传队列`, 'info');
+        },
+
+        addDownloadFile(filename, fileUrl, totalBytes) {
+            const task = new DownloadTask(filename, fileUrl, totalBytes);
+            this.downloadTasks.push(task);
+            this.scheduleNext();
+            this.openDrawer('download');
+            showToast(`已添加下载任务: ${filename}`, 'info');
+        },
+
+        scheduleNext() {
+            // 调度上传任务
+            const runningUploads = this.uploadTasks.filter(t => t.status === 'running').length;
+            if (runningUploads < this.maxConcurrent) {
+                const pendingUpload = this.uploadTasks.find(t => t.status === 'pending');
+                if (pendingUpload) pendingUpload.start();
+            }
+
+            // 调度下载任务
+            const runningDownloads = this.downloadTasks.filter(t => t.status === 'running').length;
+            if (runningDownloads < this.maxConcurrent) {
+                const pendingDownload = this.downloadTasks.find(t => t.status === 'pending');
+                if (pendingDownload) pendingDownload.start();
+            }
+
+            this.updateHeaderAndCapsule();
+        },
+
+        pauseAll() {
+            this.uploadTasks.forEach(t => t.pause());
+            this.downloadTasks.forEach(t => t.pause());
+            showToast('已暂停所有传输任务', 'info');
+        },
+
+        resumeAll() {
+            this.uploadTasks.forEach(t => {
+                if (t.status === 'paused') t.status = 'pending';
+            });
+            this.downloadTasks.forEach(t => {
+                if (t.status === 'paused') t.status = 'pending';
+            });
+            this.scheduleNext();
+            showToast('已开始排队传输', 'info');
+        },
+
+        clearCompleted() {
+            this.uploadTasks = this.uploadTasks.filter(t => t.status !== 'completed');
+            this.downloadTasks = this.downloadTasks.filter(t => t.status !== 'completed');
+            this.onTaskUpdated();
+            showToast('已清空所有已完成任务记录', 'info');
+        },
+
+        removeUploadTask(id) {
+            this.uploadTasks = this.uploadTasks.filter(t => t.id !== id);
+            this.onTaskUpdated();
+            this.scheduleNext();
+        },
+
+        removeDownloadTask(id) {
+            this.downloadTasks = this.downloadTasks.filter(t => t.id !== id);
+            this.onTaskUpdated();
+            this.scheduleNext();
+        },
+
+        onTaskUpdated() {
+            this.renderTaskList();
+            this.updateHeaderAndCapsule();
+        },
+
+        triggerDirectoryRefresh() {
+            loadDirectory(state.currentPath, false);
+        },
+
+        updateHeaderAndCapsule() {
+            let totalUpSpeed = 0;
+            let totalDownSpeed = 0;
+            let activeCount = 0;
+
+            for (const t of this.uploadTasks) {
+                if (t.status === 'running') {
+                    totalUpSpeed += t.speed;
+                    activeCount++;
+                } else if (t.status === 'pending') {
+                    activeCount++;
+                }
+            }
+
+            for (const t of this.downloadTasks) {
+                if (t.status === 'running') {
+                    totalDownSpeed += t.speed;
+                    activeCount++;
+                } else if (t.status === 'pending') {
+                    activeCount++;
+                }
+            }
+
+            // 更新右下角胶囊
+            document.getElementById('capsuleUpSpeed').innerText = `↑ ${formatSpeed(totalUpSpeed)}`;
+            document.getElementById('capsuleDownSpeed').innerText = `↓ ${formatSpeed(totalDownSpeed)}`;
+            const capsuleBadge = document.getElementById('capsuleBadge');
+            const headerActiveCount = document.getElementById('headerActiveCount');
+
+            if (activeCount > 0) {
+                capsuleBadge.innerText = activeCount;
+                capsuleBadge.style.display = 'block';
+                headerActiveCount.innerText = activeCount;
+                headerActiveCount.style.display = 'inline-block';
+            } else {
+                capsuleBadge.style.display = 'none';
+                headerActiveCount.style.display = 'none';
+            }
+
+            // Tab 徽标更新
+            document.getElementById('tabUploadBadge').innerText = this.uploadTasks.length;
+            document.getElementById('tabDownloadBadge').innerText = this.downloadTasks.length;
+        },
+
+        renderTaskList() {
+            const uploadList = document.getElementById('uploadTaskList');
+            const downloadList = document.getElementById('downloadTaskList');
+
+            // 渲染上传列表
+            if (this.uploadTasks.length === 0) {
+                uploadList.innerHTML = '<div class="task-empty-state"><p>暂无上传任务</p></div>';
+            } else {
+                uploadList.innerHTML = this.uploadTasks.map(t => {
+                    const percent = t.totalBytes > 0 ? ((t.uploadedBytes / t.totalBytes) * 100).toFixed(1) : 0;
+                    return `
+                    <div class="task-card" id="${t.id}">
+                        <div class="task-top">
+                            <div class="task-name-box">
+                                <span class="task-file-icon">📤</span>
+                                <span class="task-file-name" title="${escapeHtml(t.filename)}">${escapeHtml(t.filename)}</span>
+                            </div>
+                            <span class="task-badge-status ${t.status}">${this.getStatusText(t.status)}</span>
+                        </div>
+                        <div class="task-progress-track">
+                            <div class="task-progress-bar ${t.status}" style="width: ${percent}%"></div>
+                        </div>
+                        <div class="task-meta-row">
+                            <span>${formatBytes(t.uploadedBytes)} / ${formatBytes(t.totalBytes)} (${percent}%)</span>
+                            <span>${t.status === 'running' ? formatSpeed(t.speed) + ' · 剩余 ' + formatETA(t.eta) : ''}</span>
+                        </div>
+                        <div class="task-actions">
+                            ${t.status === 'running' ? `<button class="task-action-btn" onclick="window.TransferManager.pauseTask('up', '${t.id}')">⏸ 暂停</button>` : ''}
+                            ${t.status === 'paused' || t.status === 'error' ? `<button class="task-action-btn" onclick="window.TransferManager.resumeTask('up', '${t.id}')">▶ 继续</button>` : ''}
+                            <button class="task-action-btn danger" onclick="window.TransferManager.cancelTask('up', '${t.id}')">✕ 取消</button>
+                        </div>
+                    </div>`;
+                }).join('');
+            }
+
+            // 渲染下载列表
+            if (this.downloadTasks.length === 0) {
+                downloadList.innerHTML = '<div class="task-empty-state"><p>暂无下载任务</p></div>';
+            } else {
+                downloadList.innerHTML = this.downloadTasks.map(t => {
+                    const percent = t.totalBytes > 0 ? ((t.receivedBytes / t.totalBytes) * 100).toFixed(1) : 0;
+                    return `
+                    <div class="task-card" id="${t.id}">
+                        <div class="task-top">
+                            <div class="task-name-box">
+                                <span class="task-file-icon">📥</span>
+                                <span class="task-file-name" title="${escapeHtml(t.filename)}">${escapeHtml(t.filename)}</span>
+                            </div>
+                            <span class="task-badge-status ${t.status}">${this.getStatusText(t.status)}</span>
+                        </div>
+                        <div class="task-progress-track">
+                            <div class="task-progress-bar ${t.status}" style="width: ${percent}%"></div>
+                        </div>
+                        <div class="task-meta-row">
+                            <span>${formatBytes(t.receivedBytes)} / ${formatBytes(t.totalBytes)} (${percent}%)</span>
+                            <span>${t.status === 'running' ? formatSpeed(t.speed) + ' · 剩余 ' + formatETA(t.eta) : ''}</span>
+                        </div>
+                        <div class="task-actions">
+                            ${t.status === 'running' ? `<button class="task-action-btn" onclick="window.TransferManager.pauseTask('down', '${t.id}')">⏸ 暂停</button>` : ''}
+                            ${t.status === 'paused' || t.status === 'error' ? `<button class="task-action-btn" onclick="window.TransferManager.resumeTask('down', '${t.id}')">▶ 继续</button>` : ''}
+                            <button class="task-action-btn danger" onclick="window.TransferManager.cancelTask('down', '${t.id}')">✕ 取消</button>
+                        </div>
+                    </div>`;
+                }).join('');
+            }
+        },
+
+        getStatusText(status) {
+            const map = {
+                pending: '排队中',
+                running: '传输中',
+                paused: '已暂停',
+                completed: '已完成',
+                error: '传输失败'
+            };
+            return map[status] || status;
+        },
+
+        pauseTask(type, id) {
+            if (type === 'up') {
+                const t = this.uploadTasks.find(x => x.id === id);
+                if (t) t.pause();
+            } else {
+                const t = this.downloadTasks.find(x => x.id === id);
+                if (t) t.pause();
+            }
+        },
+
+        resumeTask(type, id) {
+            if (type === 'up') {
+                const t = this.uploadTasks.find(x => x.id === id);
+                if (t) t.resume();
+            } else {
+                const t = this.downloadTasks.find(x => x.id === id);
+                if (t) t.resume();
+            }
+        },
+
+        cancelTask(type, id) {
+            if (type === 'up') {
+                const t = this.uploadTasks.find(x => x.id === id);
+                if (t) t.cancel();
+            } else {
+                const t = this.downloadTasks.find(x => x.id === id);
+                if (t) t.cancel();
+            }
+        },
+
+        openDrawer(tab = 'upload') {
+            document.getElementById('transferDrawer').classList.add('active');
+            if (tab === 'download') {
+                document.getElementById('tabDownloadBtn').click();
+            } else {
+                document.getElementById('tabUploadBtn').click();
+            }
+        },
+
+        closeDrawer() {
+            document.getElementById('transferDrawer').classList.remove('active');
+        }
+    };
+    window.TransferManager = TransferManager;
+
+    // ==========================================================================
+    // 5. 目录加载与渲染系统 (Directory Loader & Views)
+    // ==========================================================================
+    async function loadDirectory(targetPath, pushState = true) {
+        const cleanPath = normalizePath(targetPath);
+        state.selectedPaths.clear();
+        updateBatchDock();
+
+        try {
+            const queryUrl = (cleanPath === '/' ? '' : cleanPath) + '/?json';
+            const response = await fetch(queryUrl);
+            if (!response.ok) {
+                throw new Error(`加载目录失败 (HTTP ${response.status})`);
+            }
+            const data = await response.json();
+
+            state.currentPath = cleanPath;
+            state.uriPrefix = data.uri_prefix || '/';
+            state.allowUpload = data.allow_upload !== false;
+            state.allowDelete = data.allow_delete !== false;
+            state.allowSearch = data.allow_search !== false;
+            state.allowArchive = data.allow_archive !== false;
+            state.items = data.paths || [];
+
+            if (pushState) {
+                history.pushState({ path: cleanPath }, '', cleanPath);
+            }
+
+            renderBreadcrumbs();
+            applyFilterAndSort();
+        } catch (err) {
+            showToast(err.message, 'error');
+        }
+    }
+
+    function renderBreadcrumbs() {
+        const container = document.getElementById('breadcrumbs');
+        container.innerHTML = '';
+
+        const parts = state.currentPath.split('/').filter(Boolean);
+        let accumulated = '';
+
+        // 根目录
+        const rootItem = document.createElement('span');
+        rootItem.className = 'crumb-item' + (parts.length === 0 ? ' current' : '');
+        rootItem.innerText = '根目录';
+        rootItem.onclick = () => loadDirectory('/');
+        container.appendChild(rootItem);
+
+        for (let i = 0; i < parts.length; i++) {
+            accumulated += '/' + parts[i];
+            const sep = document.createElement('span');
+            sep.className = 'crumb-separator';
+            sep.innerText = '/';
+            container.appendChild(sep);
+
+            const item = document.createElement('span');
+            const isLast = (i === parts.length - 1);
+            item.className = 'crumb-item' + (isLast ? ' current' : '');
+            item.innerText = decodeURIComponent(parts[i]);
+            if (!isLast) {
+                const target = accumulated;
+                item.onclick = () => loadDirectory(target);
+            }
+            container.appendChild(item);
+        }
+
+        // 上一级按钮显隐
+        document.getElementById('upDirBtn').style.display = (state.currentPath === '/' ? 'none' : 'inline-flex');
+    }
+
+    function applyFilterAndSort() {
+        const keyword = document.getElementById('searchInput').value.trim().toLowerCase();
+        let items = [...state.items];
+
+        if (keyword) {
+            items = items.filter(it => it.name.toLowerCase().includes(keyword));
+        }
+
+        const [field, direction] = state.sortBy.split('-');
+        items.sort((a, b) => {
+            // 目录始终优先置顶
+            const aIsDir = (a.path_type === 'Dir' || a.path_type === 'SymlinkDir');
+            const bIsDir = (b.path_type === 'Dir' || b.path_type === 'SymlinkDir');
+            if (aIsDir && !bIsDir) return -1;
+            if (!aIsDir && bIsDir) return 1;
+
+            let valA = a[field];
+            let valB = b[field];
+
+            if (field === 'name') {
+                return direction === 'asc' 
+                    ? String(valA).localeCompare(String(valB)) 
+                    : String(valB).localeCompare(String(valA));
+            }
+            valA = valA || 0;
+            valB = valB || 0;
+            return direction === 'asc' ? valA - valB : valB - valA;
+        });
+
+        state.filteredItems = items;
+        renderMainView();
+        updateDirStats();
+    }
+
+    function updateDirStats() {
+        let dirCount = 0;
+        let fileCount = 0;
+        let totalBytes = 0;
+        for (const it of state.items) {
+            if (it.path_type === 'Dir' || it.path_type === 'SymlinkDir') {
+                dirCount++;
+            } else {
+                fileCount++;
+                totalBytes += (it.size || 0);
+            }
+        }
+        document.getElementById('statText').innerText = `${dirCount} 个文件夹, ${fileCount} 个文件 (共 ${formatBytes(totalBytes)})`;
+    }
+
+    function renderMainView() {
+        const listContainer = document.getElementById('listViewContainer');
+        const gridContainer = document.getElementById('gridViewContainer');
+        const emptyState = document.getElementById('emptyState');
+
+        if (state.filteredItems.length === 0) {
+            listContainer.style.display = 'none';
+            gridContainer.style.display = 'none';
+            emptyState.style.display = 'block';
+            return;
+        }
+
+        emptyState.style.display = 'none';
+        if (state.viewMode === 'list') {
+            listContainer.style.display = 'block';
+            gridContainer.style.display = 'none';
+            renderListView();
+        } else {
+            listContainer.style.display = 'none';
+            gridContainer.style.display = 'block';
+            renderGridView();
+        }
+    }
+
+    function renderListView() {
+        const tbody = document.getElementById('fileTableBody');
+        tbody.innerHTML = state.filteredItems.map((item, idx) => {
+            const isDir = (item.path_type === 'Dir' || item.path_type === 'SymlinkDir');
+            const itemPath = (state.currentPath === '/' ? '' : state.currentPath) + '/' + item.name;
+            const isSelected = state.selectedPaths.has(item.name);
+            const sizeStr = isDir ? '-' : formatBytes(item.size);
+            const mtimeStr = formatTime(item.mtime);
+            const icon = getFileIcon(item);
+
+            return `
+            <tr class="file-row ${isSelected ? 'selected' : ''}" data-name="${escapeHtml(item.name)}" data-index="${idx}">
+                <td class="col-checkbox" onclick="event.stopPropagation()">
+                    <input type="checkbox" class="row-checkbox" ${isSelected ? 'checked' : ''} onchange="window.handleRowSelect('${escapeHtml(item.name)}', ${idx}, event)">
+                </td>
+                <td class="col-name" onclick="window.handleItemClick('${escapeHtml(item.name)}', ${isDir})">
+                    <div class="name-cell">
+                        <span class="file-icon">${icon}</span>
+                        <span class="file-name-text">${escapeHtml(item.name)}</span>
+                    </div>
+                </td>
+                <td class="col-size">${sizeStr}</td>
+                <td class="col-mtime">${mtimeStr}</td>
+                <td class="col-actions" onclick="event.stopPropagation()">
+                    ${!isDir ? `<button class="row-action-btn" title="加入传输任务中心下载" onclick="window.triggerDownload('${escapeHtml(item.name)}', ${item.size})">⬇ 下载</button>` : ''}
+                    ${isDir ? `<button class="row-action-btn" title="打包 Zip 下载" onclick="window.triggerZipDownload('${escapeHtml(item.name)}')">📦 打包</button>` : ''}
+                    <button class="row-action-btn" title="重命名" onclick="window.triggerRename('${escapeHtml(item.name)}')">✏️</button>
+                    <button class="row-action-btn delete" title="删除" onclick="window.triggerDelete('${escapeHtml(item.name)}')">🗑️</button>
+                </td>
+            </tr>`;
+        }).join('');
+    }
+
+    function renderGridView() {
+        const container = document.getElementById('gridItemsContainer');
+        container.innerHTML = state.filteredItems.map((item, idx) => {
+            const isDir = (item.path_type === 'Dir' || item.path_type === 'SymlinkDir');
+            const isSelected = state.selectedPaths.has(item.name);
+            const sizeStr = isDir ? '文件夹' : formatBytes(item.size);
+            const icon = getFileIcon(item);
+            const isImg = isImageFile(item.name);
+            const itemUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/' + encodeURIComponent(item.name);
+
+            return `
+            <div class="grid-card ${isSelected ? 'selected' : ''}" onclick="window.handleItemClick('${escapeHtml(item.name)}', ${isDir})" data-name="${escapeHtml(item.name)}">
+                <input type="checkbox" class="grid-checkbox" ${isSelected ? 'checked' : ''} onclick="event.stopPropagation()" onchange="window.handleRowSelect('${escapeHtml(item.name)}', ${idx}, event)">
+                <div class="grid-thumb-box">
+                    ${isImg 
+                        ? `<img class="grid-thumb-img" src="${itemUrl}" alt="" loading="lazy">` 
+                        : `<span class="grid-icon">${icon}</span>`
+                    }
+                </div>
+                <div class="grid-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</div>
+                <div class="grid-meta">${sizeStr}</div>
+            </div>`;
+        }).join('');
+    }
+
+    // ==========================================================================
+    // 6. 交互响应 (Item Clicks, Previews & Multi-Select)
+    // ==========================================================================
+    window.handleItemClick = function (name, isDir) {
+        if (isDir) {
+            const nextPath = (state.currentPath === '/' ? '' : state.currentPath) + '/' + name;
+            loadDirectory(nextPath);
+        } else {
+            // 打开在线预览
+            openPreview(name);
+        }
+    };
+
+    window.handleRowSelect = function (name, index, e) {
+        if (e.shiftKey && state.lastSelectedIndex !== -1) {
+            // Shift 范围连选
+            const start = Math.min(state.lastSelectedIndex, index);
+            const end = Math.max(state.lastSelectedIndex, index);
+            for (let i = start; i <= end; i++) {
+                state.selectedPaths.add(state.filteredItems[i].name);
+            }
+        } else {
+            if (state.selectedPaths.has(name)) {
+                state.selectedPaths.delete(name);
+            } else {
+                state.selectedPaths.add(name);
+            }
+        }
+        state.lastSelectedIndex = index;
+        renderMainView();
+        updateBatchDock();
+    };
+
+    function updateBatchDock() {
+        const dock = document.getElementById('batchDock');
+        const count = state.selectedPaths.size;
+        if (count > 0) {
+            dock.classList.add('active');
+            document.getElementById('batchSelectedCount').innerText = `已选 ${count} 项`;
+            let totalBytes = 0;
+            for (const name of state.selectedPaths) {
+                const item = state.items.find(it => it.name === name);
+                if (item && item.size) totalBytes += item.size;
+            }
+            document.getElementById('batchSelectedSize').innerText = `(${formatBytes(totalBytes)})`;
+        } else {
+            dock.classList.remove('active');
+        }
+
+        // 同步全选 Checkbox 状态
+        const selectAllCb = document.getElementById('selectAllCheckbox');
+        selectAllCb.checked = (state.filteredItems.length > 0 && state.selectedPaths.size === state.filteredItems.length);
+    }
+
+    // ==========================================================================
+    // 7. 多媒体与代码在线预览 (Lightbox / Preview)
+    // ==========================================================================
+    async function openPreview(filename) {
+        const modal = document.getElementById('previewModal');
+        const title = document.getElementById('previewTitle');
+        const body = document.getElementById('previewBody');
+        const dlBtn = document.getElementById('previewDownloadBtn');
+
+        const fileUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/' + encodeURIComponent(filename);
+        title.innerText = filename;
+        body.innerHTML = '<div style="color:var(--text-muted);font-size:14px;">正在加载预览...</div>';
+        modal.classList.add('active');
+
+        dlBtn.onclick = () => {
+            const item = state.items.find(it => it.name === filename);
+            TransferManager.addDownloadFile(filename, fileUrl, item ? item.size : 0);
+        };
+
+        if (isImageFile(filename)) {
+            body.innerHTML = `<img class="preview-img" src="${fileUrl}" alt="${escapeHtml(filename)}">`;
+        } else if (['mp4', 'webm', 'ogg', 'mov'].includes(getFileExtension(filename))) {
+            body.innerHTML = `<video class="preview-media" src="${fileUrl}" controls autoplay></video>`;
+        } else if (['mp3', 'wav', 'flac'].includes(getFileExtension(filename))) {
+            body.innerHTML = `<audio class="preview-media" src="${fileUrl}" controls autoplay style="width:100%;max-width:500px;"></audio>`;
+        } else if (isTextFile(filename)) {
+            try {
+                const res = await fetch(fileUrl);
+                const text = await res.text();
+                body.innerHTML = `<pre class="preview-text-box"><code>${escapeHtml(text)}</code></pre>`;
+            } catch (err) {
+                body.innerHTML = `<div style="color:var(--danger)">加载文件内容失败: ${escapeHtml(err.message)}</div>`;
+            }
+        } else {
+            body.innerHTML = `
+                <div style="text-align:center;padding:40px;">
+                    <div style="font-size:48px;margin-bottom:12px;">📄</div>
+                    <p style="color:var(--text-secondary);font-size:14px;margin-bottom:16px;">该文件格式不支持在线预览，请直接下载后查看。</p>
+                    <button class="btn btn-primary" onclick="window.triggerDownload('${escapeHtml(filename)}')">下载此文件</button>
+                </div>
+            `;
+        }
+    }
+
+    // ==========================================================================
+    // 8. 核心 CRUD 操作 (Download, Zip, Mkdir, Delete, Move)
+    // ==========================================================================
+    window.triggerDownload = function (filename, size) {
+        const fileUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/' + encodeURIComponent(filename);
+        TransferManager.addDownloadFile(filename, fileUrl, size || 0);
+    };
+
+    window.triggerZipDownload = function (dirname) {
+        const targetUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/' + encodeURIComponent(dirname) + '/?zip';
+        window.open(targetUrl, '_blank');
+    };
+
+    window.triggerRename = function (oldName) {
+        openPromptModal('重命名', oldName, async (newName) => {
+            if (!newName || newName === oldName) return;
+            const srcUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/' + encodeURIComponent(oldName);
+            const dstUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/' + encodeURIComponent(newName);
+
+            try {
+                const res = await fetch(srcUrl, {
+                    method: 'MOVE',
+                    headers: { 'Destination': dstUrl }
+                });
+                if (!res.ok) throw new Error(`重命名失败 (HTTP ${res.status})`);
+                showToast(`已成功重命名为: ${newName}`, 'success');
+                loadDirectory(state.currentPath, false);
+            } catch (err) {
+                showToast(err.message, 'error');
+            }
+        });
+    };
+
+    window.triggerDelete = function (name) {
+        openConfirmModal('确认删除', `确定要彻底删除 "${name}" 吗？此操作无法撤销。`, async () => {
+            const targetUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/' + encodeURIComponent(name);
+            try {
+                const res = await fetch(targetUrl, { method: 'DELETE' });
+                if (!res.ok) throw new Error(`删除失败 (HTTP ${res.status})`);
+                showToast(`已删除: ${name}`, 'success');
+                loadDirectory(state.currentPath, false);
+            } catch (err) {
+                showToast(err.message, 'error');
+            }
+        });
+    };
+
+    // 弹窗辅助
+    function openPromptModal(title, defaultValue, onConfirm) {
+        const modal = document.getElementById('promptModal');
+        const titleEl = document.getElementById('promptTitle');
+        const input = document.getElementById('promptInput');
+        const okBtn = document.getElementById('promptConfirmBtn');
+
+        titleEl.innerText = title;
+        input.value = defaultValue || '';
+        modal.classList.add('active');
+        input.focus();
+
+        const close = () => modal.classList.remove('active');
+        document.getElementById('promptClose').onclick = close;
+        document.getElementById('promptCancelBtn').onclick = close;
+
+        okBtn.onclick = () => {
+            close();
+            onConfirm(input.value.trim());
+        };
+    }
+
+    function openConfirmModal(title, message, onConfirm) {
+        const modal = document.getElementById('confirmModal');
+        document.getElementById('confirmTitle').innerText = title;
+        document.getElementById('confirmMessage').innerText = message;
+        modal.classList.add('active');
+
+        const close = () => modal.classList.remove('active');
+        document.getElementById('confirmClose').onclick = close;
+        document.getElementById('confirmCancelBtn').onclick = close;
+
+        document.getElementById('confirmOkBtn').onclick = () => {
+            close();
+            onConfirm();
+        };
+    }
+
+    // ==========================================================================
+    // 9. 纯前端离线高保真矢量 SVG 二维码生成器 (真实编码，微信/相机毫秒识别)
+    // ==========================================================================
+    function renderSvgQrCode(text, container) {
+        if (!container) return;
+
+        let svgHtml = '';
+        if (window.LanQRCode && typeof window.LanQRCode.createSvg === 'function') {
+            try {
+                // 严格遵循 ISO/IEC 18004 标准：4 模块纯白静区 + M 级纠错
+                svgHtml = window.LanQRCode.createSvg(text, {
+                    margin: 4,
+                    size: 210,
+                    level: 'M'
+                });
+            } catch (err) {
+                console.error('QR code generation error:', err);
+            }
+        }
+
+        if (!svgHtml) {
+            svgHtml = `
+                <div style="padding:20px;color:#ef4444;font-size:13px;text-align:center;">
+                    二维码引擎加载异常，请在手机浏览器中直接输入下方网址访问。
+                </div>
+            `;
+        }
+
+        container.innerHTML = `
+            <div style="display:flex;justify-content:center;align-items:center;background:#ffffff;padding:12px;border-radius:12px;border:1px solid var(--border,#e2e8f0);box-shadow:0 4px 12px rgba(0,0,0,0.05);margin:0 auto;max-width:234px;">
+                ${svgHtml}
+            </div>
+        `;
+    }
+
+    // ==========================================================================
+    // 10. 事件绑定与初始化 (Init & Event Bindings)
+    // ==========================================================================
+    function init() {
+        // 1. 主题初始化
+        document.documentElement.setAttribute('data-theme', state.theme);
+        document.getElementById('themeToggleBtn').onclick = () => {
+            state.theme = state.theme === 'light' ? 'dark' : 'light';
+            document.documentElement.setAttribute('data-theme', state.theme);
+            localStorage.setItem('lan_theme', state.theme);
+        };
+
+        // 2. 视图切换
+        const listBtn = document.getElementById('listViewBtn');
+        const gridBtn = document.getElementById('gridViewBtn');
+        const setViewMode = (mode) => {
+            state.viewMode = mode;
+            localStorage.setItem('lan_view_mode', mode);
+            listBtn.classList.toggle('active', mode === 'list');
+            gridBtn.classList.toggle('active', mode === 'grid');
+            renderMainView();
+        };
+        listBtn.onclick = () => setViewMode('list');
+        gridBtn.onclick = () => setViewMode('grid');
+        setViewMode(state.viewMode);
+
+        // 3. 排序绑定
+        const sortSelect = document.getElementById('sortSelect');
+        sortSelect.value = state.sortBy;
+        sortSelect.onchange = () => {
+            state.sortBy = sortSelect.value;
+            localStorage.setItem('lan_sort_by', state.sortBy);
+            applyFilterAndSort();
+        };
+
+        // 4. 搜索框绑定
+        const searchInput = document.getElementById('searchInput');
+        const clearSearchBtn = document.getElementById('clearSearchBtn');
+        searchInput.oninput = () => {
+            clearSearchBtn.style.display = searchInput.value ? 'block' : 'none';
+            applyFilterAndSort();
+        };
+        clearSearchBtn.onclick = () => {
+            searchInput.value = '';
+            clearSearchBtn.style.display = 'none';
+            applyFilterAndSort();
+        };
+
+        // 5. 上一级按钮
+        document.getElementById('upDirBtn').onclick = () => {
+            const parts = state.currentPath.split('/').filter(Boolean);
+            if (parts.length > 0) {
+                parts.pop();
+                loadDirectory('/' + parts.join('/'));
+            }
+        };
+
+        // 6. 全选 / 取消全选
+        document.getElementById('selectAllCheckbox').onchange = (e) => {
+            if (e.target.checked) {
+                state.filteredItems.forEach(it => state.selectedPaths.add(it.name));
+            } else {
+                state.selectedPaths.clear();
+            }
+            renderMainView();
+            updateBatchDock();
+        };
+
+        // 7. 批量操作坞事件
+        document.getElementById('batchCancelBtn').onclick = () => {
+            state.selectedPaths.clear();
+            renderMainView();
+            updateBatchDock();
+        };
+
+        document.getElementById('batchDownloadBtn').onclick = () => {
+            for (const name of state.selectedPaths) {
+                const item = state.items.find(it => it.name === name);
+                if (item && item.path_type !== 'Dir') {
+                    const fileUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/' + encodeURIComponent(name);
+                    TransferManager.addDownloadFile(name, fileUrl, item.size || 0);
+                }
+            }
+            state.selectedPaths.clear();
+            renderMainView();
+            updateBatchDock();
+        };
+
+        document.getElementById('batchZipBtn').onclick = () => {
+            const targetUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/?zip';
+            window.open(targetUrl, '_blank');
+        };
+
+        document.getElementById('batchDeleteBtn').onclick = () => {
+            const count = state.selectedPaths.size;
+            openConfirmModal('批量删除', `确定要彻底删除选中的 ${count} 个项目吗？`, async () => {
+                const names = Array.from(state.selectedPaths);
+                state.selectedPaths.clear();
+                updateBatchDock();
+
+                for (const name of names) {
+                    const targetUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/' + encodeURIComponent(name);
+                    try {
+                        await fetch(targetUrl, { method: 'DELETE' });
+                    } catch (e) {}
+                }
+                showToast(`已完成批量删除 ${count} 项`, 'success');
+                loadDirectory(state.currentPath, false);
+            });
+        };
+
+        // 8. 核心按钮: 上传文件与上传目录
+        const fileInput = document.getElementById('hiddenFileInput');
+        const folderInput = document.getElementById('hiddenFolderInput');
+        document.getElementById('uploadFileBtn').onclick = () => fileInput.click();
+        document.getElementById('uploadFolderBtn').onclick = () => folderInput.click();
+
+        fileInput.onchange = () => {
+            if (fileInput.files.length > 0) {
+                TransferManager.addUploadFiles(fileInput.files, state.currentPath);
+                fileInput.value = '';
+            }
+        };
+        folderInput.onchange = () => {
+            if (folderInput.files.length > 0) {
+                TransferManager.addUploadFiles(folderInput.files, state.currentPath);
+                folderInput.value = '';
+            }
+        };
+
+        // 9. 新建文件夹
+        document.getElementById('newFolderBtn').onclick = () => {
+            openPromptModal('新建文件夹', '新建文件夹', async (folderName) => {
+                if (!folderName) return;
+                const targetUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/' + encodeURIComponent(folderName);
+                try {
+                    const res = await fetch(targetUrl, { method: 'MKCOL' });
+                    if (!res.ok) throw new Error(`新建文件夹失败 (HTTP ${res.status})`);
+                    showToast(`已创建文件夹: ${folderName}`, 'success');
+                    loadDirectory(state.currentPath, false);
+                } catch (err) {
+                    showToast(err.message, 'error');
+                }
+            });
+        };
+
+        // 10. 打包下载当前目录
+        document.getElementById('downloadZipBtn').onclick = () => {
+            const targetUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/?zip';
+            window.open(targetUrl, '_blank');
+        };
+
+        // 11. 传输任务中心抽屉与胶囊控制
+        const drawer = document.getElementById('transferDrawer');
+        document.getElementById('transferCapsule').onclick = () => drawer.classList.toggle('active');
+        document.getElementById('headerTransferBtn').onclick = () => drawer.classList.toggle('active');
+        document.getElementById('closeDrawerBtn').onclick = () => drawer.classList.remove('active');
+
+        document.getElementById('resumeAllBtn').onclick = () => TransferManager.resumeAll();
+        document.getElementById('pauseAllBtn').onclick = () => TransferManager.pauseAll();
+        document.getElementById('clearCompletedBtn').onclick = () => TransferManager.clearCompleted();
+
+        const tabUp = document.getElementById('tabUploadBtn');
+        const tabDown = document.getElementById('tabDownloadBtn');
+        const upList = document.getElementById('uploadTaskList');
+        const downList = document.getElementById('downloadTaskList');
+
+        tabUp.onclick = () => {
+            tabUp.classList.add('active');
+            tabDown.classList.remove('active');
+            upList.style.display = 'flex';
+            downList.style.display = 'none';
+        };
+        tabDown.onclick = () => {
+            tabDown.classList.add('active');
+            tabUp.classList.remove('active');
+            upList.style.display = 'none';
+            downList.style.display = 'flex';
+        };
+
+        // 12. 全屏拖拽上传 (Drag & Drop)
+        const dropOverlay = document.getElementById('dropOverlay');
+        let dragCounter = 0;
+
+        window.addEventListener('dragenter', (e) => {
+            e.preventDefault();
+            dragCounter++;
+            dropOverlay.classList.add('active');
+        });
+        window.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            dragCounter--;
+            if (dragCounter <= 0) {
+                dropOverlay.classList.remove('active');
+            }
+        });
+        window.addEventListener('dragover', (e) => e.preventDefault());
+        window.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dragCounter = 0;
+            dropOverlay.classList.remove('active');
+
+            if (e.dataTransfer && e.dataTransfer.files.length > 0) {
+                TransferManager.addUploadFiles(e.dataTransfer.files, state.currentPath);
+            }
+        });
+
+        function getAssetsBaseUrl() {
+            if (window.DUFS_ASSETS_PREFIX && !window.DUFS_ASSETS_PREFIX.includes('__ASSETS_PREFIX__')) {
+                return window.DUFS_ASSETS_PREFIX;
+            }
+            const scripts = document.querySelectorAll('script[src*="app.js"]');
+            for (const s of scripts) {
+                const src = s.getAttribute('src') || s.src;
+                if (src && src.includes('app.js')) {
+                    const idx = src.lastIndexOf('/');
+                    if (idx !== -1) {
+                        return src.substring(0, idx + 1);
+                    }
+                }
+            }
+            return '/';
+        }
+
+        // 13. 扫码弹窗 (智能纠正 127.0.0.1 为真实物理局域网 IP，确保手机秒通)
+        document.getElementById('qrModalBtn').onclick = async () => {
+            const modal = document.getElementById('qrModal');
+            const urlText = document.getElementById('modalQrUrlText');
+            const box = document.getElementById('modalQrCodeBox');
+
+            // 优先获取真实的物理局域网信息
+            if (!state.serverInfo) {
+                try {
+                    const assetsUrl = getAssetsBaseUrl();
+                    const resp = await fetch(assetsUrl + 'server-info.json?t=' + Date.now());
+                    if (resp.ok) {
+                        state.serverInfo = await resp.json();
+                    }
+                } catch (e) {}
+            }
+
+            const isLoopback = window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost';
+            let targetUrl = window.location.origin + window.location.pathname;
+
+            // 核心策略：只要是 127.0.0.1 或 localhost，手机必然连不上，强制转换为物理局域网真实 IP
+            if (isLoopback) {
+                const lanIp = (state.serverInfo && state.serverInfo.primary_ip) ? state.serverInfo.primary_ip : '192.168.3.49';
+                const portPart = window.location.port ? (':' + window.location.port) : (state.serverInfo && state.serverInfo.port ? (':' + state.serverInfo.port) : ':5000');
+                targetUrl = window.location.protocol + '//' + lanIp + portPart + window.location.pathname;
+            }
+
+            urlText.innerText = targetUrl;
+            renderSvgQrCode(targetUrl, box);
+            modal.classList.add('active');
+        };
+        document.getElementById('qrModalClose').onclick = () => {
+            document.getElementById('qrModal').classList.remove('active');
+        };
+        document.getElementById('copyUrlBtn').onclick = () => {
+            const url = document.getElementById('modalQrUrlText').innerText;
+            navigator.clipboard.writeText(url).then(() => {
+                showToast('已复制局域网访问链接！', 'success');
+            }).catch(() => {
+                showToast('复制失败，请手动长按复制', 'error');
+            });
+        };
+
+        // 14. 预览弹窗关闭
+        document.getElementById('previewCloseBtn').onclick = () => {
+            document.getElementById('previewModal').classList.remove('active');
+            document.getElementById('previewBody').innerHTML = '';
+        };
+
+        // 15. SPA 浏览器历史前进/后退
+        window.onpopstate = (e) => {
+            const path = (e.state && e.state.path) ? e.state.path : window.location.pathname;
+            loadDirectory(path, false);
+        };
+
+        // 16. 首屏数据加载 (优先解析 __INDEX_DATA__)
+        let firstLoaded = false;
+        if (window.__INDEX_DATA__ && window.__INDEX_DATA__ !== '__INDEX_DATA__') {
+            try {
+                const jsonStr = decodeURIComponent(escape(atob(window.__INDEX_DATA__)));
+                const data = JSON.parse(jsonStr);
+                state.currentPath = normalizePath(window.location.pathname);
+                state.uriPrefix = data.uri_prefix || '/';
+                state.allowUpload = data.allow_upload !== false;
+                state.allowDelete = data.allow_delete !== false;
+                state.allowSearch = data.allow_search !== false;
+                state.allowArchive = data.allow_archive !== false;
+                state.items = data.paths || [];
+
+                renderBreadcrumbs();
+                applyFilterAndSort();
+                firstLoaded = true;
+            } catch (e) {
+                // 解码失败时 fallback
+            }
+        }
+
+        if (!firstLoaded) {
+            loadDirectory(window.location.pathname, false);
+        }
+    }
+
+    // 页面加载完毕执行初始化
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+})();

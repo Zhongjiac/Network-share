@@ -1003,6 +1003,13 @@ body {
 .task-badge-status.completed { background: var(--success-light); color: var(--success); }
 .task-badge-status.error { background: var(--danger-light); color: var(--danger); }
 .task-badge-status.pending { background: var(--bg-hover); color: var(--text-muted); }
+.task-badge-status.choosing,
+.task-badge-status.awaiting-save,
+.task-badge-status.pausing,
+.task-badge-status.resetting { background: var(--warning-light); color: var(--warning); }
+.task-badge-status.finishing { background: var(--primary-light); color: var(--primary); }
+.task-badge-status.handedoff,
+.task-badge-status.cancelling { background: var(--bg-hover); color: var(--text-muted); }
 
 /* 进度条 */
 .task-progress-track {

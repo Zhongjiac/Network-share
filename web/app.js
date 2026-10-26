@@ -713,354 +713,513 @@
     // ==========================================================================
     // 4. 传输任务中心引擎 (Transfer Manager)
     // ==========================================================================
+    // 上传按固定大小分段；下载使用有背压的文件流，不保留整文件缓冲。
+    const TRANSFER_LIMITS = Object.freeze({ chunkBytes: 8 * 1024 * 1024,
+        idleMs: 60000, headMs: 10000 });
+
     class UploadTask {
         constructor(file, targetDir) {
-            this.id = 'up_' + Math.random().toString(36).substring(2, 10);
+            this.id = 'up_' + Math.random().toString(36).slice(2);
             this.file = file;
             this.targetDir = targetDir;
+            this.targetKey = (targetDir + '/' + file.name).toLowerCase();
             this.filename = file.name;
-            this.targetUrl = (targetDir === '/' ? '' : targetDir) + '/' + encodeURIComponent(this.filename);
+            this.targetUrl = (targetDir === '/' ? '' : targetDir) + '/' + encodeURIComponent(file.name);
             this.totalBytes = file.size;
             this.uploadedBytes = 0;
             this.serverOffset = 0;
-            this.status = 'pending'; // pending, running, paused, completed, error
-            this.speed = 0;
-            this.eta = 0;
+            this.status = 'pending';
+            this.speed = this.eta = 0;
             this.errorMessage = '';
+            this.generation = 0;
+            this.attempted = false;
             this.xhr = null;
-            this.lastTime = 0;
-            this.lastLoaded = 0;
+            this.timer = null;
         }
 
         start() {
-            if (this.status === 'running') return;
+            if (this.status !== 'pending' || !this.file) return;
             this.status = 'running';
             this.errorMessage = '';
-            this.lastTime = performance.now();
-            this.lastLoaded = this.uploadedBytes;
-
-            // 1. 探针 HEAD 查询服务器当前已落盘大小，支持智能断点续传
-            const headXhr = new XMLHttpRequest();
-            headXhr.open('HEAD', this.targetUrl, true);
-            headXhr.onload = () => {
-                let existingSize = 0;
-                if (headXhr.status >= 200 && headXhr.status < 300) {
-                    const cl = headXhr.getResponseHeader('Content-Length');
-                    if (cl) existingSize = parseInt(cl, 10) || 0;
-                }
-                // 若服务端已完整拥有此文件，直接标记完成
-                if (existingSize >= this.totalBytes) {
-                    this.uploadedBytes = this.totalBytes;
-                    this.status = 'completed';
-                    TransferManager.onTaskUpdated();
-                    TransferManager.triggerDirectoryRefresh();
+            const generation = ++this.generation;
+            // 仅恢复本任务已经开始的上传；同名文件不能仅按大小判断内容相同。
+            const xhr = this.xhr = new XMLHttpRequest();
+            xhr.open('HEAD', this.targetUrl, true);
+            xhr.timeout = TRANSFER_LIMITS.headMs;
+            xhr.onload = () => {
+                if (!this.isCurrent(generation)) return;
+                const rawLength = xhr.getResponseHeader('Content-Length');
+                const length = rawLength === null ? NaN : Number(rawLength);
+                if (!this.attempted && xhr.status >= 200 && xhr.status < 300) {
+                    this.fail(generation, '目标文件已存在，请重命名后上传，避免误覆盖');
                     return;
                 }
-                this.serverOffset = existingSize;
-                this.uploadedBytes = existingSize;
-                this.executeTransfer();
+                if (xhr.status === 404) {
+                    this.serverOffset = this.uploadedBytes = 0;
+                } else if (xhr.status >= 200 && xhr.status < 300 &&
+                    Number.isSafeInteger(length) && length >= 0 && length <= this.totalBytes) {
+                    this.serverOffset = this.uploadedBytes = length;
+                } else {
+                    this.fail(generation, '无法确认上传断点，请取消后重新上传');
+                    return;
+                }
+                if (this.attempted && this.serverOffset === this.totalBytes && this.totalBytes > 0) this.complete(generation);
+                else this.executeTransfer(generation);
             };
-            headXhr.onerror = () => {
-                this.serverOffset = 0;
-                this.executeTransfer();
-            };
-            headXhr.send();
+            xhr.onerror = () => this.fail(generation, '上传断点探测失败');
+            xhr.ontimeout = () => this.fail(generation, '上传断点探测超时（10 s）');
+            xhr.send();
+            TransferManager.onTaskUpdated();
         }
 
-        executeTransfer() {
-            if (this.status !== 'running') return;
-            this.xhr = new XMLHttpRequest();
+        isCurrent(generation) {
+            return generation === this.generation && this.status === 'running';
+        }
 
-            // 若 offset > 0 则通过 PATCH 追加上传；否则通过首次 PUT 上传
-            const isAppend = this.serverOffset > 0;
-            const method = isAppend ? 'PATCH' : 'PUT';
-            const sliceData = isAppend ? this.file.slice(this.serverOffset) : this.file;
-
-            this.xhr.open(method, this.targetUrl, true);
-            if (isAppend) {
-                this.xhr.setRequestHeader('X-Update-Range', 'append');
-            }
-
-            this.xhr.upload.onprogress = (e) => {
-                if (this.status !== 'running') return;
-                const currentLoaded = this.serverOffset + e.loaded;
-                this.uploadedBytes = Math.min(currentLoaded, this.totalBytes);
-
-                // EWMA 实时速率计算
+        executeTransfer(generation) {
+            if (!this.isCurrent(generation)) return;
+            const xhr = this.xhr = new XMLHttpRequest();
+            const offset = this.serverOffset;
+            const end = Math.min(offset + TRANSFER_LIMITS.chunkBytes, this.totalBytes);
+            xhr.open(offset > 0 ? 'PATCH' : 'PUT', this.targetUrl, true);
+            if (offset > 0) xhr.setRequestHeader('X-Update-Range', 'append');
+            let lastTime = performance.now();
+            let lastLoaded = offset;
+            const armIdle = () => {
+                clearTimeout(this.timer);
+                this.timer = setTimeout(() => this.fail(generation, '上传无进展超时（60 s），可继续重试'), TRANSFER_LIMITS.idleMs);
+            };
+            xhr.upload.onprogress = event => {
+                if (!this.isCurrent(generation)) return;
+                armIdle();
+                this.uploadedBytes = Math.min(offset + event.loaded, end);
                 const now = performance.now();
-                const dt = (now - this.lastTime) / 1000;
-                if (dt >= 0.25) {
-                    const dBytes = currentLoaded - this.lastLoaded;
-                    const instantSpeed = dBytes / dt;
-                    this.speed = this.speed === 0 ? instantSpeed : this.speed * 0.65 + instantSpeed * 0.35;
-                    this.lastTime = now;
-                    this.lastLoaded = currentLoaded;
-                    const remaining = this.totalBytes - this.uploadedBytes;
-                    this.eta = this.speed > 0 ? remaining / this.speed : 0;
-                }
-                TransferManager.onTaskUpdated();
-            };
-
-            this.xhr.onload = () => {
-                if (this.xhr.status >= 200 && this.xhr.status < 300) {
-                    this.uploadedBytes = this.totalBytes;
-                    this.status = 'completed';
-                    this.speed = 0;
-                    this.eta = 0;
-                    TransferManager.onTaskUpdated();
-                    TransferManager.triggerDirectoryRefresh();
-                    TransferManager.scheduleNext();
-                } else {
-                    this.status = 'error';
-                    this.errorMessage = `HTTP ${this.xhr.status}`;
-                    TransferManager.onTaskUpdated();
-                    TransferManager.scheduleNext();
+                if (now - lastTime >= 200) {
+                    this.speed = (this.uploadedBytes - lastLoaded) * 1000 / (now - lastTime);
+                    this.eta = this.speed ? (this.totalBytes - this.uploadedBytes) / this.speed : 0;
+                    lastTime = now;
+                    lastLoaded = this.uploadedBytes;
+                    TransferManager.updateTaskProgressDOM(this);
                 }
             };
-
-            this.xhr.onerror = () => {
-                if (this.status === 'paused') return;
-                this.status = 'error';
-                this.errorMessage = '网络连接中断';
-                TransferManager.onTaskUpdated();
-                TransferManager.scheduleNext();
+            xhr.onload = () => {
+                if (!this.isCurrent(generation)) return;
+                clearTimeout(this.timer);
+                if (xhr.status < 200 || xhr.status >= 300) {
+                    this.fail(generation, `HTTP ${xhr.status}`);
+                    return;
+                }
+                this.serverOffset = this.uploadedBytes = end;
+                if (end === this.totalBytes) this.complete(generation);
+                else this.executeTransfer(generation);
             };
+            xhr.onerror = () => this.fail(generation, '网络连接中断，可继续重试');
+            this.attempted = true;
+            armIdle();
+            try { xhr.send(this.file.slice(offset, end)); }
+            catch (error) { this.fail(generation, error.message); }
+        }
 
-            this.xhr.onabort = () => {
-                this.speed = 0;
-                this.eta = 0;
-                TransferManager.onTaskUpdated();
-            };
+        complete(generation) {
+            if (!this.isCurrent(generation)) return;
+            this.stopRequest();
+            this.status = 'completed';
+            this.uploadedBytes = this.totalBytes;
+            this.file = null;
+            TransferManager.onTaskUpdated();
+            TransferManager.triggerDirectoryRefresh();
+            TransferManager.scheduleNext();
+        }
 
-            this.xhr.send(sliceData);
+        fail(generation, message) {
+            if (!this.isCurrent(generation)) return;
+            this.stopRequest();
+            this.status = 'error';
+            this.errorMessage = message;
+            TransferManager.onTaskUpdated();
+            TransferManager.scheduleNext();
+        }
+
+        stopRequest() {
+            ++this.generation;
+            clearTimeout(this.timer);
+            const xhr = this.xhr;
+            this.xhr = null;
+            if (xhr) xhr.abort();
+            this.speed = this.eta = 0;
         }
 
         pause() {
-            if (this.status !== 'running') return;
+            if (!['running', 'pending'].includes(this.status)) return;
+            this.stopRequest();
             this.status = 'paused';
-            if (this.xhr) {
-                this.xhr.abort();
-                this.xhr = null;
-            }
-            this.speed = 0;
-            this.eta = 0;
             TransferManager.onTaskUpdated();
             TransferManager.scheduleNext();
         }
 
         resume() {
-            if (this.status === 'paused' || this.status === 'error') {
-                this.start();
-            }
+            if (!['paused', 'error'].includes(this.status)) return;
+            this.status = 'pending';
+            TransferManager.scheduleNext();
         }
 
         cancel() {
-            if (this.xhr) {
-                this.xhr.abort();
-                this.xhr = null;
-            }
+            this.stopRequest();
+            this.status = 'cancelled';
+            this.file = null;
             TransferManager.removeUploadTask(this.id);
         }
     }
 
     class DownloadTask {
         constructor(filename, fileUrl, totalBytes) {
-            this.id = 'down_' + Math.random().toString(36).substring(2, 10);
+            this.id = 'down_' + Math.random().toString(36).slice(2);
             this.filename = filename;
             this.fileUrl = fileUrl;
-            this.totalBytes = totalBytes || 0;
+            this.totalBytes = Number.isSafeInteger(totalBytes) && totalBytes > 0 ? totalBytes : null;
             this.receivedBytes = 0;
+            this.status = 'pending';
             this.chunks = [];
-            this.status = 'pending'; // pending, running, paused, completed, error
-            this.speed = 0;
-            this.eta = 0;
+            this.speed = this.eta = 0;
             this.errorMessage = '';
+            this.validator = null;
+            this.generation = 0;
+            this.runPromise = null;
+            this.resumeRequested = false;
             this.abortController = null;
-            this.lastTime = 0;
-            this.lastLoaded = 0;
         }
 
-        async start() {
-            if (this.status === 'running') return;
+        start() {
+            if (this.status !== 'pending' || this.runPromise) return;
             this.status = 'running';
             this.errorMessage = '';
-            this.abortController = new AbortController();
-            this.lastTime = performance.now();
-            this.lastLoaded = this.receivedBytes;
+            this.resumeRequested = false;
+            const generation = ++this.generation;
+            this.runPromise = Promise.resolve().then(() => this.run(generation));
+        }
 
-            const headers = {};
-            if (this.receivedBytes > 0) {
-                headers['Range'] = `bytes=${this.receivedBytes}-`;
-            }
-
-            try {
-                const response = await fetch(this.fileUrl, {
-                    headers: headers,
-                    signal: this.abortController.signal
-                });
-
-                if (!response.ok && response.status !== 206) {
-                    throw new Error(`HTTP ${response.status}`);
-                }
-
-                if (response.status === 200 && this.receivedBytes > 0) {
-                    // 服务端不支持 Range，降级重传
+        validateResponse(response, offset) {
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const rawLength = response.headers.get('Content-Length');
+            const length = rawLength === null ? null : Number(rawLength);
+            if (length !== null && (!Number.isSafeInteger(length) || length < 0)) throw new Error('响应长度无效');
+            const etag = response.headers.get('ETag');
+            const validator = etag && !etag.startsWith('W/') ? { name: 'ETag', value: etag } :
+                response.headers.get('Last-Modified') ? { name: 'Last-Modified', value: response.headers.get('Last-Modified') } : null;
+            if (offset) {
+                const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('Content-Range') || '');
+                if (response.status !== 206 || !range || !range.slice(1).every(n => Number.isSafeInteger(Number(n))) || Number(range[1]) !== offset) {
+                    // 若服务器不支持 Range 或文件已变更，清空先前数据，平稳重新开始
                     this.chunks = [];
                     this.receivedBytes = 0;
+                    if (length !== null) this.totalBytes = length;
+                    this.validator = validator;
+                    return length;
                 }
+                this.totalBytes = Number(range[3]);
+            } else {
+                if (response.status !== 200 && response.status !== 206) throw new Error('下载响应状态不匹配');
+                if (length !== null) this.totalBytes = length;
+                this.validator = validator;
+            }
+            return length;
+        }
 
-                if (!this.totalBytes) {
-                    const cl = response.headers.get('Content-Length');
-                    if (cl) this.totalBytes = parseInt(cl, 10) || 0;
+        async run(generation) {
+            const current = () => generation === this.generation && this.status === 'running';
+            const controller = this.abortController = new AbortController();
+            let response;
+            let reader;
+            let timer;
+            let timedOut = false;
+            const armIdle = () => {
+                clearTimeout(timer);
+                timer = setTimeout(() => { timedOut = true; controller.abort(); }, TRANSFER_LIMITS.idleMs);
+            };
+            try {
+                if (!current()) return;
+                const offset = this.receivedBytes;
+                const headers = {};
+                if (offset > 0) {
+                    headers['Range'] = `bytes=${offset}-`;
+                    if (this.validator) headers['If-Range'] = this.validator.value;
                 }
+                armIdle();
+                response = await fetch(this.fileUrl, { method: 'GET', headers, signal: controller.signal });
+                if (!current()) return;
+                
+                const length = this.validateResponse(response, offset);
+                clearTimeout(timer);
+                
+                reader = response.body.getReader();
+                let lastTime = performance.now();
+                let lastLoaded = this.receivedBytes;
+                if (!this.chunks) this.chunks = [];
 
-                const reader = response.body.getReader();
-                while (true) {
+                while (reader && current()) {
+                    armIdle();
                     const { done, value } = await reader.read();
+                    clearTimeout(timer);
+                    if (!current()) return;
+                    if (timedOut) throw new Error('下载无进展超时（60 s），可继续重试');
                     if (done) break;
 
                     this.chunks.push(value);
-                    this.receivedBytes += value.length;
+                    this.receivedBytes += value.byteLength;
 
-                    // EWMA 速率计算
                     const now = performance.now();
-                    const dt = (now - this.lastTime) / 1000;
-                    if (dt >= 0.25) {
-                        const dBytes = this.receivedBytes - this.lastLoaded;
-                        const instantSpeed = dBytes / dt;
-                        this.speed = this.speed === 0 ? instantSpeed : this.speed * 0.65 + instantSpeed * 0.35;
-                        this.lastTime = now;
-                        this.lastLoaded = this.receivedBytes;
-                        if (this.totalBytes > this.receivedBytes) {
-                            this.eta = this.speed > 0 ? (this.totalBytes - this.receivedBytes) / this.speed : 0;
-                        }
+                    if (now - lastTime >= 200) {
+                        this.speed = (this.receivedBytes - lastLoaded) * 1000 / (now - lastTime);
+                        this.eta = this.speed && this.totalBytes !== null ? Math.max(0, this.totalBytes - this.receivedBytes) / this.speed : 0;
+                        lastTime = now;
+                        lastLoaded = this.receivedBytes;
+                        TransferManager.updateTaskProgressDOM(this);
                     }
-                    TransferManager.onTaskUpdated();
                 }
+                if (!current()) return;
 
-                // 下载全部完成，生成 Blob 落盘
-                this.status = 'completed';
-                this.speed = 0;
-                this.eta = 0;
-                const blob = new Blob(this.chunks);
+                // 下载完成，进入落盘阶段
+                this.status = 'finishing';
+                this.speed = this.eta = 0;
+                TransferManager.updateTaskProgressDOM(this);
+                TransferManager.onTaskUpdated();
+
+                // 组装 Blob 并立即清空 chunks 引用，防止内存泄漏
+                const blob = new Blob(this.chunks, { type: 'application/octet-stream' });
+                this.chunks.length = 0;
+                this.chunks = null;
+
+                // 触发保存落盘
                 const blobUrl = URL.createObjectURL(blob);
                 const a = document.createElement('a');
+                a.style.display = 'none';
                 a.href = blobUrl;
                 a.download = this.filename;
                 document.body.appendChild(a);
                 a.click();
-                document.body.removeChild(a);
-                setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
+                setTimeout(() => {
+                    a.remove();
+                    URL.revokeObjectURL(blobUrl);
+                }, 1000);
 
-                showToast(`已成功下载: ${this.filename}`, 'success');
-                TransferManager.onTaskUpdated();
-                TransferManager.scheduleNext();
-            } catch (err) {
-                if (err.name === 'AbortError') {
-                    // 用户暂停
-                    this.status = 'paused';
-                } else {
-                    this.status = 'error';
-                    this.errorMessage = err.message || '网络连接失败';
-                    showToast(`下载失败: ${this.filename}`, 'error');
+                this.status = 'completed';
+            } catch (error) {
+                if (this.status === 'cancelling') return;
+                if (this.status === 'pausing' && !timedOut) return;
+                this.status = 'error';
+                this.resumeRequested = false;
+                this.errorMessage = timedOut ? '下载无进展超时（60 s），可继续重试' : error.message;
+            } finally {
+                clearTimeout(timer);
+                controller.abort();
+                try {
+                    if (reader) await reader.cancel();
+                    else if (response && response.body) await response.body.cancel();
+                } catch (_) {}
+
+                if (this.status === 'cancelling') {
+                    if (this.chunks) {
+                        this.chunks.length = 0;
+                        this.chunks = null;
+                    }
+                    this.status = 'cancelled';
+                    TransferManager.removeDownloadTask(this.id);
+                } else if (this.status === 'pausing') {
+                    this.status = this.resumeRequested && !TransferManager.suspended ? 'pending' : 'paused';
                 }
-                this.speed = 0;
-                this.eta = 0;
+                this.abortController = null;
+                this.speed = this.eta = 0;
+                this.runPromise = null;
                 TransferManager.onTaskUpdated();
                 TransferManager.scheduleNext();
             }
         }
 
         pause() {
-            if (this.status !== 'running') return;
-            if (this.abortController) {
-                this.abortController.abort();
-                this.abortController = null;
-            }
-            this.status = 'paused';
-            this.speed = 0;
-            this.eta = 0;
+            if (this.status === 'pending') this.status = 'paused';
+            else if (this.status === 'running') {
+                this.status = 'pausing';
+                if (this.abortController) this.abortController.abort();
+            } else return;
+            this.resumeRequested = false;
+            this.speed = this.eta = 0;
             TransferManager.onTaskUpdated();
             TransferManager.scheduleNext();
         }
 
         resume() {
-            if (this.status === 'paused' || this.status === 'error') {
-                this.start();
+            if (this.status === 'pausing') { this.resumeRequested = true; return; }
+            if (!['paused', 'error'].includes(this.status) || this.runPromise) return;
+            this.status = 'pending';
+            TransferManager.scheduleNext();
+        }
+
+        restart() {
+            if (this.status !== 'error' || this.runPromise) return;
+            if (this.chunks) {
+                this.chunks.length = 0;
+                this.chunks = null;
             }
+            this.receivedBytes = 0;
+            this.totalBytes = null;
+            this.validator = null;
+            this.status = TransferManager.suspended ? 'paused' : 'pending';
+            TransferManager.onTaskUpdated();
+            TransferManager.scheduleNext();
         }
 
         cancel() {
-            if (this.abortController) {
-                this.abortController.abort();
-                this.abortController = null;
+            if (['finishing', 'cancelling'].includes(this.status)) return;
+            ++this.generation;
+            this.status = 'cancelling';
+            this.resumeRequested = false;
+            if (this.abortController) this.abortController.abort();
+            if (this.chunks) {
+                this.chunks.length = 0;
+                this.chunks = null;
             }
-            this.chunks = [];
+            TransferManager.onTaskUpdated();
+            if (this.runPromise) return;
+            this.status = 'cancelled';
             TransferManager.removeDownloadTask(this.id);
         }
     }
+
 
     const TransferManager = {
         uploadTasks: [],
         downloadTasks: [],
         maxConcurrent: 3,
+        maxConcurrentDownloads: 2,
+        scheduling: false,
+        suspended: false,
+        pages: { upload: 0, download: 0 },
+        pageSize: 50,
+        renderTimer: null,
+        capsuleTimer: null,
 
-        addUploadFiles(files, targetDir) {
-            for (const file of files) {
-                const task = new UploadTask(file, targetDir || state.currentPath);
+        async addUploadFiles(files, targetDir) {
+            const snapshot = Array.from(files);
+            const directory = targetDir || state.currentPath;
+            this.openDrawer('upload');
+            let skipped = 0;
+            const targets = new Set(this.uploadTasks.filter(t => !['completed', 'cancelled'].includes(t.status)).map(t => t.targetKey));
+            for (let i = 0; i < snapshot.length; i++) {
+                const task = new UploadTask(snapshot[i], directory);
+                snapshot[i] = null;
+                const key = task.targetKey;
+                if (targets.has(key)) { skipped++; continue; }
+                targets.add(key);
+                if (this.suspended) task.status = 'paused';
                 this.uploadTasks.push(task);
+                if (i % 100 === 99) {
+                    this.scheduleNext();
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                }
             }
             this.scheduleNext();
-            this.openDrawer('upload');
-            showToast(`已添加 ${files.length} 个文件至上传队列`, 'info');
+            this.onTaskUpdated();
+            showToast(`已添加 ${snapshot.length - skipped} 个上传任务${skipped ? `，跳过 ${skipped} 个同路径任务` : ''}`, 'info');
         },
 
-        addDownloadFile(filename, fileUrl, totalBytes) {
+        addDownloadFile(filename, fileUrl, totalBytes, defer = false) {
             const task = new DownloadTask(filename, fileUrl, totalBytes);
+            if (this.suspended) task.status = 'paused';
             this.downloadTasks.push(task);
-            this.scheduleNext();
+            if (!defer) {
+                this.openDrawer('download');
+                this.scheduleNext();
+            }
+            this.onTaskUpdated();
+            return task;
+        },
+
+        async addDownloadFiles(files) {
+            if (!files.length) return;
             this.openDrawer('download');
-            showToast(`已添加下载任务: ${filename}`, 'info');
+            const names = new Set(this.downloadTasks.filter(t => !['completed', 'cancelled'].includes(t.status)).map(t => t.filename.toLowerCase()));
+            let skipped = 0;
+            let added = 0;
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                const key = file.name.toLowerCase();
+                if (names.has(key)) { skipped++; continue; }
+                names.add(key);
+                this.addDownloadFile(file.name, file.url, file.size, true);
+                added++;
+                if (i % 100 === 99) {
+                    this.scheduleNext();
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                }
+            }
+            this.scheduleNext();
+            this.onTaskUpdated();
+            showToast(`已添加 ${added} 个下载任务${skipped ? `，跳过 ${skipped} 个已在队列的任务` : ''}`, 'info');
+        },
+
+        restartDownloadTask(id) {
+            const task = this.downloadTasks.find(t => t.id === id);
+            if (task) task.restart();
         },
 
         scheduleNext() {
-            // 调度上传任务
-            const runningUploads = this.uploadTasks.filter(t => t.status === 'running').length;
-            if (runningUploads < this.maxConcurrent) {
-                const pendingUpload = this.uploadTasks.find(t => t.status === 'pending');
-                if (pendingUpload) pendingUpload.start();
-            }
+            if (this.scheduling || this.suspended) return;
+            this.scheduling = true;
+            try {
+                // 上传并发调度 (上限 maxConcurrent: 3)
+                let runningUploads = this.uploadTasks.filter(t => t.runPromise || ['running', 'pausing', 'cancelling'].includes(t.status)).length;
+                for (const task of this.uploadTasks) {
+                    if (runningUploads >= this.maxConcurrent) break;
+                    if (task.status !== 'pending') continue;
+                    runningUploads++;
+                    try { task.start(); }
+                    catch (error) {
+                        if (task.stopRequest) task.stopRequest();
+                        task.status = 'error';
+                        task.errorMessage = error.message;
+                    }
+                }
 
-            // 调度下载任务
-            const runningDownloads = this.downloadTasks.filter(t => t.status === 'running').length;
-            if (runningDownloads < this.maxConcurrent) {
-                const pendingDownload = this.downloadTasks.find(t => t.status === 'pending');
-                if (pendingDownload) pendingDownload.start();
-            }
-
-            this.updateHeaderAndCapsule();
+                // 下载并发调度 (专属上限 maxConcurrentDownloads: 2，杜绝多大文件并发撑爆内存)
+                let runningDownloads = this.downloadTasks.filter(t => t.runPromise || ['running', 'pausing', 'finishing', 'cancelling'].includes(t.status)).length;
+                for (const task of this.downloadTasks) {
+                    if (runningDownloads >= (this.maxConcurrentDownloads || 2)) break;
+                    if (task.status !== 'pending') continue;
+                    runningDownloads++;
+                    try { task.start(); }
+                    catch (error) {
+                        task.status = 'error';
+                        task.errorMessage = error.message;
+                    }
+                }
+            } finally { this.scheduling = false; }
+            this.onTaskUpdated();
         },
 
         pauseAll() {
+            this.suspended = true;
             this.uploadTasks.forEach(t => t.pause());
             this.downloadTasks.forEach(t => t.pause());
+            this.onTaskUpdated();
             showToast('已暂停所有传输任务', 'info');
         },
 
         resumeAll() {
+            this.suspended = false;
             this.uploadTasks.forEach(t => {
                 if (t.status === 'paused') t.status = 'pending';
             });
             this.downloadTasks.forEach(t => {
-                if (t.status === 'paused') t.status = 'pending';
+                if (t.status === 'pausing') t.resumeRequested = true;
+                else if (t.status === 'paused') t.status = 'pending';
             });
             this.scheduleNext();
             showToast('已开始排队传输', 'info');
         },
 
         clearCompleted() {
-            this.uploadTasks = this.uploadTasks.filter(t => t.status !== 'completed');
-            this.downloadTasks = this.downloadTasks.filter(t => t.status !== 'completed');
+            this.uploadTasks = this.uploadTasks.filter(t => !['completed', 'cancelled'].includes(t.status));
+            this.downloadTasks = this.downloadTasks.filter(t => !['completed', 'cancelled'].includes(t.status));
             this.onTaskUpdated();
             showToast('已清空所有已完成任务记录', 'info');
         },
@@ -1077,13 +1236,78 @@
             this.scheduleNext();
         },
 
+        updateTaskProgressDOM(task) {
+            const card = document.getElementById(task.id);
+            if (!card) return;
+            const isUpload = task.id.startsWith('up_');
+            const currentBytes = isUpload ? task.uploadedBytes : task.receivedBytes;
+            const percent = task.totalBytes > 0 ? Math.min(100, currentBytes * 100 / task.totalBytes).toFixed(1) : (task.status === 'completed' ? 100 : 0);
+
+            // 更新进度条
+            const bar = card.querySelector('.task-progress-bar');
+            if (bar) {
+                bar.style.width = percent + '%';
+                bar.className = 'task-progress-bar ' + task.status;
+            }
+
+            // 更新状态徽标
+            const badge = card.querySelector('.task-badge-status');
+            if (badge) {
+                badge.className = 'task-badge-status ' + task.status;
+                badge.textContent = this.getStatusText(task.status);
+            }
+
+            // 更新已传大小 / 进度百分比 / 速度 / ETA
+            const metaSpans = card.querySelectorAll('.task-meta-row span');
+            if (metaSpans.length >= 2) {
+                metaSpans[0].textContent = `${formatBytes(currentBytes)} / ${task.totalBytes === null ? '总大小未知' : formatBytes(task.totalBytes) + ' (' + percent + '%)'}`;
+                metaSpans[1].textContent = task.status === 'running' ? formatSpeed(task.speed) + (task.totalBytes === null ? '' : ' · 剩余 ' + formatETA(task.eta)) : '';
+            }
+
+            // 节流触发速度徽标与右下角胶囊
+            this.throttledUpdateCapsule();
+        },
+
+        throttledUpdateCapsule() {
+            if (this.capsuleTimer) return;
+            this.capsuleTimer = setTimeout(() => {
+                this.capsuleTimer = null;
+                this.updateHeaderAndCapsule();
+            }, 300);
+        },
+
         onTaskUpdated() {
-            this.renderTaskList();
-            this.updateHeaderAndCapsule();
+            if (this.renderTimer) return;
+            this.renderTimer = setTimeout(() => {
+                this.renderTimer = null;
+                if (document.getElementById('transferDrawer').classList.contains('active')) this.renderTaskList();
+                this.updateHeaderAndCapsule();
+            }, 200);
         },
 
         triggerDirectoryRefresh() {
-            loadDirectory(state.currentPath, false);
+            if (this.refreshTimer) return;
+            this.refreshTimer = setTimeout(() => {
+                this.refreshTimer = null;
+                if (directoryLoading) { this.triggerDirectoryRefresh(); return; }
+                loadDirectory(state.currentPath, false);
+            }, 1000);
+        },
+
+        pageTasks(type, delta) {
+            this.pages[type] = Math.max(0, this.pages[type] + delta);
+            this.onTaskUpdated();
+        },
+
+        taskPage(type, tasks) {
+            this.pages[type] = Math.min(this.pages[type], Math.max(0, Math.ceil(tasks.length / this.pageSize) - 1));
+            return tasks.slice(this.pages[type] * this.pageSize, (this.pages[type] + 1) * this.pageSize);
+        },
+
+        taskPager(type, count) {
+            return `<div class="task-meta-row"><button onclick="TransferManager.pageTasks('${type}', -1)" ${this.pages[type] === 0 ? 'disabled' : ''}>上一页</button>
+                <span>${this.pages[type] + 1} / ${Math.max(1, Math.ceil(count / this.pageSize))} 页 · ${count} 项</span>
+                <button onclick="TransferManager.pageTasks('${type}', 1)" ${(this.pages[type] + 1) * this.pageSize >= count ? 'disabled' : ''}>下一页</button></div>`;
         },
 
         updateHeaderAndCapsule() {
@@ -1104,7 +1328,7 @@
                 if (t.status === 'running') {
                     totalDownSpeed += t.speed;
                     activeCount++;
-                } else if (t.status === 'pending') {
+                } else if (t.status === 'pending' || t.runPromise) {
                     activeCount++;
                 }
             }
@@ -1138,7 +1362,7 @@
             if (this.uploadTasks.length === 0) {
                 uploadList.innerHTML = '<div class="task-empty-state"><p>暂无上传任务</p></div>';
             } else {
-                uploadList.innerHTML = this.uploadTasks.map(t => {
+                uploadList.innerHTML = this.taskPage('upload', this.uploadTasks).map(t => {
                     const percent = t.totalBytes > 0 ? ((t.uploadedBytes / t.totalBytes) * 100).toFixed(1) : 0;
                     return `
                     <div class="task-card" id="${t.id}">
@@ -1148,6 +1372,7 @@
                                 <span class="task-file-name" title="${escapeHtml(t.filename)}">${escapeHtml(t.filename)}</span>
                             </div>
                             <span class="task-badge-status ${t.status}">${this.getStatusText(t.status)}</span>
+                            ${t.errorMessage ? `<span class="task-error-tip" title="${escapeHtml(t.errorMessage)}">${escapeHtml(t.errorMessage)}</span>` : ''}
                         </div>
                         <div class="task-progress-track">
                             <div class="task-progress-bar ${t.status}" style="width: ${percent}%"></div>
@@ -1162,15 +1387,15 @@
                             <button class="task-action-btn danger" onclick="window.TransferManager.cancelTask('up', '${t.id}')">✕ 取消</button>
                         </div>
                     </div>`;
-                }).join('');
+                }).join('') + this.taskPager('upload', this.uploadTasks.length);
             }
 
             // 渲染下载列表
             if (this.downloadTasks.length === 0) {
                 downloadList.innerHTML = '<div class="task-empty-state"><p>暂无下载任务</p></div>';
             } else {
-                downloadList.innerHTML = this.downloadTasks.map(t => {
-                    const percent = t.totalBytes > 0 ? ((t.receivedBytes / t.totalBytes) * 100).toFixed(1) : 0;
+                downloadList.innerHTML = this.taskPage('download', this.downloadTasks).map(t => {
+                    const percent = t.totalBytes > 0 ? Math.min(100, t.receivedBytes * 100 / t.totalBytes).toFixed(1) : t.status === 'completed' ? 100 : 0;
                     return `
                     <div class="task-card" id="${t.id}">
                         <div class="task-top">
@@ -1179,21 +1404,22 @@
                                 <span class="task-file-name" title="${escapeHtml(t.filename)}">${escapeHtml(t.filename)}</span>
                             </div>
                             <span class="task-badge-status ${t.status}">${this.getStatusText(t.status)}</span>
+                            ${t.errorMessage ? `<span class="task-error-tip" title="${escapeHtml(t.errorMessage)}">${escapeHtml(t.errorMessage)}</span>` : ''}
                         </div>
                         <div class="task-progress-track">
                             <div class="task-progress-bar ${t.status}" style="width: ${percent}%"></div>
                         </div>
                         <div class="task-meta-row">
-                            <span>${formatBytes(t.receivedBytes)} / ${formatBytes(t.totalBytes)} (${percent}%)</span>
-                            <span>${t.status === 'running' ? formatSpeed(t.speed) + ' · 剩余 ' + formatETA(t.eta) : ''}</span>
+                            <span>${formatBytes(t.receivedBytes)} / ${t.totalBytes === null ? '总大小未知' : formatBytes(t.totalBytes) + ' (' + percent + '%)'}</span>
+                            <span>${t.status === 'running' ? formatSpeed(t.speed) + (t.totalBytes === null ? '' : ' · 剩余 ' + formatETA(t.eta)) : ''}</span>
                         </div>
                         <div class="task-actions">
                             ${t.status === 'running' ? `<button class="task-action-btn" onclick="window.TransferManager.pauseTask('down', '${t.id}')">⏸ 暂停</button>` : ''}
                             ${t.status === 'paused' || t.status === 'error' ? `<button class="task-action-btn" onclick="window.TransferManager.resumeTask('down', '${t.id}')">▶ 继续</button>` : ''}
-                            <button class="task-action-btn danger" onclick="window.TransferManager.cancelTask('down', '${t.id}')">✕ 取消</button>
+                            ${!['finishing', 'cancelling'].includes(t.status) ? `<button class="task-action-btn danger" onclick="window.TransferManager.cancelTask('down', '${t.id}')">${t.status === 'completed' ? '移除记录' : '✕ 取消'}</button>` : ''}
                         </div>
                     </div>`;
-                }).join('');
+                }).join('') + this.taskPager('download', this.downloadTasks.length);
             }
         },
 
@@ -1203,7 +1429,10 @@
                 running: '传输中',
                 paused: '已暂停',
                 completed: '已完成',
-                error: '传输失败'
+                error: '传输失败',
+                pausing: '正在暂停',
+                finishing: '正在保存',
+                cancelling: '正在取消'
             };
             return map[status] || status;
         },
@@ -1219,6 +1448,7 @@
         },
 
         resumeTask(type, id) {
+            this.suspended = false;
             if (type === 'up') {
                 const t = this.uploadTasks.find(x => x.id === id);
                 if (t) t.resume();
@@ -1240,6 +1470,7 @@
 
         openDrawer(tab = 'upload') {
             document.getElementById('transferDrawer').classList.add('active');
+            this.onTaskUpdated();
             if (tab === 'download') {
                 document.getElementById('tabDownloadBtn').click();
             } else {
@@ -1256,18 +1487,32 @@
     // ==========================================================================
     // 5. 目录加载与渲染系统 (Directory Loader & Views)
     // ==========================================================================
+    let directoryController = null;
+    let directoryLoading = false;
+    let directoryGeneration = 0;
+    let directoryPage = 0;
+    const DIRECTORY_PAGE_SIZE = 200;
+    let previewController = null;
+
     async function loadDirectory(targetPath, pushState = true) {
+        const generation = ++directoryGeneration;
+        directoryLoading = true;
+        if (directoryController) directoryController.abort();
+        const controller = directoryController = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000);
         const cleanPath = normalizePath(targetPath);
         state.selectedPaths.clear();
         updateBatchDock();
 
         try {
             const queryUrl = (cleanPath === '/' ? '' : cleanPath) + '/?json';
-            const response = await fetch(queryUrl);
+            const response = await fetch(queryUrl, { signal: controller.signal });
             if (!response.ok) {
                 throw new Error(`加载目录失败 (HTTP ${response.status})`);
             }
             const data = await response.json();
+            if (generation !== directoryGeneration) return;
+            directoryPage = 0;
 
             state.currentPath = cleanPath;
             state.uriPrefix = data.uri_prefix || '/';
@@ -1284,7 +1529,10 @@
             renderBreadcrumbs();
             applyFilterAndSort();
         } catch (err) {
-            showToast(err.message, 'error');
+            if (generation === directoryGeneration) showToast(err.name === 'AbortError' ? '目录加载超时，请刷新重试' : err.message, 'error');
+        } finally {
+            clearTimeout(timeout);
+            if (generation === directoryGeneration) directoryLoading = false;
         }
     }
 
@@ -1353,6 +1601,8 @@
             return direction === 'asc' ? valA - valB : valB - valA;
         });
 
+        directoryPage = 0;
+        state.lastSelectedIndex = -1;
         state.filteredItems = items;
         renderMainView();
         updateDirStats();
@@ -1373,7 +1623,22 @@
         document.getElementById('statText').innerText = `${dirCount} 个文件夹, ${fileCount} 个文件 (共 ${formatBytes(totalBytes)})`;
     }
 
+    window.changeDirectoryPage = function (delta) {
+        directoryPage = Math.max(0, Math.min(Math.ceil(state.filteredItems.length / DIRECTORY_PAGE_SIZE) - 1, directoryPage + delta));
+        renderMainView();
+    };
+
     function renderMainView() {
+        let pager = document.getElementById('directoryPager');
+        if (!pager) {
+            pager = document.createElement('div');
+            pager.id = 'directoryPager';
+            document.getElementById('listViewContainer').parentNode.appendChild(pager);
+        }
+        pager.innerHTML = state.filteredItems.length > DIRECTORY_PAGE_SIZE ?
+            `<div class="task-meta-row"><button onclick="changeDirectoryPage(-1)" ${directoryPage === 0 ? 'disabled' : ''}>上一页</button>
+            <span>第 ${directoryPage + 1} / ${Math.ceil(state.filteredItems.length / DIRECTORY_PAGE_SIZE)} 页 · ${state.filteredItems.length} 项</span>
+            <button onclick="changeDirectoryPage(1)" ${(directoryPage + 1) * DIRECTORY_PAGE_SIZE >= state.filteredItems.length ? 'disabled' : ''}>下一页</button></div>` : '';
         const listContainer = document.getElementById('listViewContainer');
         const gridContainer = document.getElementById('gridViewContainer');
         const emptyState = document.getElementById('emptyState');
@@ -1399,7 +1664,8 @@
 
     function renderListView() {
         const tbody = document.getElementById('fileTableBody');
-        tbody.innerHTML = state.filteredItems.map((item, idx) => {
+        tbody.innerHTML = state.filteredItems.slice(directoryPage * DIRECTORY_PAGE_SIZE, (directoryPage + 1) * DIRECTORY_PAGE_SIZE).map((item, pageIndex) => {
+            const idx = directoryPage * DIRECTORY_PAGE_SIZE + pageIndex;
             const isDir = (item.path_type === 'Dir' || item.path_type === 'SymlinkDir');
             const itemPath = (state.currentPath === '/' ? '' : state.currentPath) + '/' + item.name;
             const isSelected = state.selectedPaths.has(item.name);
@@ -1432,7 +1698,8 @@
 
     function renderGridView() {
         const container = document.getElementById('gridItemsContainer');
-        container.innerHTML = state.filteredItems.map((item, idx) => {
+        container.innerHTML = state.filteredItems.slice(directoryPage * DIRECTORY_PAGE_SIZE, (directoryPage + 1) * DIRECTORY_PAGE_SIZE).map((item, pageIndex) => {
+            const idx = directoryPage * DIRECTORY_PAGE_SIZE + pageIndex;
             const isDir = (item.path_type === 'Dir' || item.path_type === 'SymlinkDir');
             const isSelected = state.selectedPaths.has(item.name);
             const sizeStr = isDir ? '文件夹' : formatBytes(item.size);
@@ -1495,8 +1762,9 @@
             dock.classList.add('active');
             document.getElementById('batchSelectedCount').innerText = `已选 ${count} 项`;
             let totalBytes = 0;
+            const itemByName = new Map(state.items.map(item => [item.name, item]));
             for (const name of state.selectedPaths) {
-                const item = state.items.find(it => it.name === name);
+                const item = itemByName.get(name);
                 if (item && item.size) totalBytes += item.size;
             }
             document.getElementById('batchSelectedSize').innerText = `(${formatBytes(totalBytes)})`;
@@ -1513,6 +1781,8 @@
     // 7. 多媒体与代码在线预览 (Lightbox / Preview)
     // ==========================================================================
     async function openPreview(filename) {
+        if (previewController) previewController.abort();
+        const controller = previewController = new AbortController();
         const modal = document.getElementById('previewModal');
         const title = document.getElementById('previewTitle');
         const body = document.getElementById('previewBody');
@@ -1536,10 +1806,32 @@
             body.innerHTML = `<audio class="preview-media" src="${fileUrl}" controls autoplay style="width:100%;max-width:500px;"></audio>`;
         } else if (isTextFile(filename)) {
             try {
-                const res = await fetch(fileUrl);
-                const text = await res.text();
+                // 即使服务器忽略 Range，也只消费前 1 MiB，随后主动取消响应体。
+                const limit = 1024 * 1024;
+                const timeout = setTimeout(() => controller.abort(), 15000);
+                let text = '';
+                try {
+                    const res = await fetch(fileUrl, { headers: { Range: `bytes=0-${limit - 1}` }, signal: controller.signal });
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    const reader = res.body.getReader();
+                    const decoder = new TextDecoder();
+                    let received = 0;
+                    try {
+                        while (received < limit) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+                            const part = value.subarray(0, limit - received);
+                            text += decoder.decode(part, { stream: true });
+                            received += part.length;
+                        }
+                        text += decoder.decode();
+                        if (received === limit) text += '\n\n（预览最多显示前 1 MiB，完整内容请下载）';
+                    } finally { await reader.cancel(); }
+                } finally { clearTimeout(timeout); }
+                if (controller !== previewController || controller.signal.aborted) return;
                 body.innerHTML = `<pre class="preview-text-box"><code>${escapeHtml(text)}</code></pre>`;
             } catch (err) {
+                if (controller !== previewController || controller.signal.aborted) return;
                 body.innerHTML = `<div style="color:var(--danger)">加载文件内容失败: ${escapeHtml(err.message)}</div>`;
             }
         } else {
@@ -1749,13 +2041,13 @@
         };
 
         document.getElementById('batchDownloadBtn').onclick = () => {
-            for (const name of state.selectedPaths) {
-                const item = state.items.find(it => it.name === name);
-                if (item && item.path_type !== 'Dir') {
-                    const fileUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/' + encodeURIComponent(name);
-                    TransferManager.addDownloadFile(name, fileUrl, item.size || 0);
-                }
-            }
+            const items = new Map(state.items.map(item => [item.name, item]));
+            const directory = state.currentPath === '/' ? '' : state.currentPath;
+            const files = Array.from(state.selectedPaths).map(name => items.get(name))
+                .filter(item => item && !['Dir', 'SymlinkDir'].includes(item.path_type))
+                .map(item => ({ name: item.name, url: directory + '/' + encodeURIComponent(item.name), size: item.size }));
+            // 在用户点击事件中请求目录选择，保持浏览器要求的用户激活。
+            TransferManager.addDownloadFiles(files);
             state.selectedPaths.clear();
             renderMainView();
             updateBatchDock();
@@ -1942,6 +2234,8 @@
 
         // 14. 预览弹窗关闭
         document.getElementById('previewCloseBtn').onclick = () => {
+            if (previewController) previewController.abort();
+            previewController = null;
             document.getElementById('previewModal').classList.remove('active');
             document.getElementById('previewBody').innerHTML = '';
         };

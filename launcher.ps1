@@ -524,12 +524,17 @@ if ($dryRun) {
     exit 0
 }
 
-# 默认双击运行时，自动在后台弹出共享文件夹
+# 默认双击运行时，自动在后台弹出共享文件夹并打开网页
 if ($sharedDir -eq $DefaultSharedDir) {
     try {
         Start-Process explorer.exe -ArgumentList "`"$sharedDir`""
     } catch {}
 }
+
+# 自动在默认浏览器中打开局域网物理 IP 的 Web 页面
+try {
+    Start-Process $primaryUrl
+} catch {}
 
 Write-Host "[*] 核心引擎已启动，按 Ctrl+C 可停止分享并退出服务...`n" -ForegroundColor Green
 

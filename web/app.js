@@ -722,9 +722,15 @@
             this.id = 'up_' + Math.random().toString(36).slice(2);
             this.file = file;
             this.targetDir = targetDir;
-            this.targetKey = (targetDir + '/' + file.name).toLowerCase();
-            this.filename = file.name;
-            this.targetUrl = (targetDir === '/' ? '' : targetDir) + '/' + encodeURIComponent(file.name);
+            // 提取并清理相对路径（去除首尾斜杠），完美保留文件夹层级
+            const rawRelative = (file.webkitRelativePath || file.relativePath || file.name).replace(/^[\/\\]+/, '').replace(/\\/g, '/');
+            this.relativePath = rawRelative;
+            this.filename = rawRelative;
+            this.targetKey = (targetDir + '/' + rawRelative).toLowerCase();
+            
+            // 对层级路径中的每一级目录分别进行 URI 编码，再以 / 连接
+            const encodedSegments = rawRelative.split('/').map(seg => encodeURIComponent(seg)).join('/');
+            this.targetUrl = (targetDir === '/' ? '' : targetDir) + '/' + encodedSegments;
             this.totalBytes = file.size;
             this.uploadedBytes = 0;
             this.serverOffset = 0;
@@ -2162,13 +2168,59 @@
             }
         });
         window.addEventListener('dragover', (e) => e.preventDefault());
-        window.addEventListener('drop', (e) => {
+        async function scanDataTransferEntries(dataTransfer) {
+            const files = [];
+            const items = dataTransfer.items;
+            if (items && items.length > 0 && typeof items[0].webkitGetAsEntry === 'function') {
+                const entries = [];
+                for (let i = 0; i < items.length; i++) {
+                    const entry = items[i].webkitGetAsEntry();
+                    if (entry) entries.push(entry);
+                }
+                const readEntry = async (entry, path = '') => {
+                    if (entry.isFile) {
+                        const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+                        file.relativePath = path ? `${path}/${file.name}` : file.name;
+                        files.push(file);
+                    } else if (entry.isDirectory) {
+                        const dirReader = entry.createReader();
+                        const dirPath = path ? `${path}/${entry.name}` : entry.name;
+                        const readAllEntries = async () => {
+                            const subEntries = await new Promise((resolve, reject) => dirReader.readEntries(resolve, reject));
+                            if (subEntries.length > 0) {
+                                for (const sub of subEntries) {
+                                    await readEntry(sub, dirPath);
+                                }
+                                await readAllEntries();
+                            }
+                        };
+                        await readAllEntries();
+                    }
+                };
+                for (const entry of entries) {
+                    await readEntry(entry);
+                }
+                return files;
+            }
+            return Array.from(dataTransfer.files || []);
+        }
+
+        window.addEventListener('drop', async (e) => {
             e.preventDefault();
             dragCounter = 0;
             dropOverlay.classList.remove('active');
 
-            if (e.dataTransfer && e.dataTransfer.files.length > 0) {
-                TransferManager.addUploadFiles(e.dataTransfer.files, state.currentPath);
+            if (e.dataTransfer) {
+                try {
+                    const files = await scanDataTransferEntries(e.dataTransfer);
+                    if (files.length > 0) {
+                        TransferManager.addUploadFiles(files, state.currentPath);
+                    }
+                } catch (err) {
+                    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                        TransferManager.addUploadFiles(e.dataTransfer.files, state.currentPath);
+                    }
+                }
             }
         });
 

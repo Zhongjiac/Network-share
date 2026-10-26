@@ -1,39 +1,46 @@
-# 局域网快传：网页内置流式下载稳定性与零内存泄漏升级方案
+# 局域网快传：启动自动打开网页与真实目录层级上传实现计划
 
 ## 1. 现状剖析与用户核心诉求
 
-### 1.1 用户核心诉求
-- **不调用浏览器下载**：坚决摒弃调用 `<a>` 标签 handoff 原生下载的方式，恢复用户原本喜爱的网盘级“网页内嵌式流式传输任务中心”体验；
-- **保持原有下载方式**：在右下角悬浮胶囊与折叠抽屉中统一管理所有任务，提供精准进度条、瞬时速度、ETA、暂停与继续断点续传能力；
-- **彻底杜绝内存泄漏与溢出**：下载完成或取消后，二进制缓冲与临时 URL 必须立刻完全释放，垃圾回收器瞬间回收集成；
-- **大文件、多文件不卡死进程**：并发受控调度，UI 渲染节流，彻底解决多文件密集更新导致浏览器标签页掉帧、主线程锁死的问题。
+### 1.1 现状与根本原因
+1. **启动未自动打开网页**：
+   - 当前 `launcher.py` 与 `launcher.ps1` 在服务启动后，仅输出了访问链接并在终端渲染二维码，虽然弹出了本地 `shared_files` 资源管理器窗口，但没有自动唤起默认浏览器打开网页，用户每次需要手动复制或点击链接。
+2. **“上传目录”退化为平铺上传文件**：
+   - 页面虽提供了 `<input type="file" id="hiddenFolderInput" webkitdirectory>`，但 `UploadTask` 构造函数中完全丢弃了文件自带的 `file.webkitRelativePath`（例如 `我的文件夹/子目录/文件.txt`），仅截取了 `file.name`；
+   - 目标上传地址 `targetUrl` 被错误硬编码拼接在当前目录下，导致原本具有层次结构的目录被强行打平为单文件散落在当前目录；
+   - 拖拽上传仅处理了扁平的 `e.dataTransfer.files`，未递归遍历文件夹 Entry，导致拖拽文件夹直接失效或被当作 0 字节文件。
+
+### 1.2 第一性原理与关键技术推导
+- **服务端特性验证**：经底层 HTTP 实测，核心引擎 dufs 在接收嵌套路径 PUT 请求时（如 `PUT /folder/sub/a.txt`），会自动递归创建所有缺失的父级目录并返回 `201 Created`，无需前端提前繁琐调用 `MKCOL`；
+- **前端相对路径保持**：只需在 `UploadTask` 中完整保留 `webkitRelativePath`，并将 URL 分段编码拼接，dufs 即可自动还原整棵目录树；
+- **拖拽递归展开**：利用 HTML5 FileSystem API（`item.webkitGetAsEntry()` + `DirectoryReader.readEntries()`）递归展开拖入的文件夹，为每个提取出的文件注入相对路径。
 
 ---
 
-## 2. 第一性原理与关键技术架构设计
+## 2. 详细技术实现方案
 
-### 2.1 内存安全与即时释放机制 (Zero-Leak Lifecycle)
-1. **活跃任务并发数硬隔离**：
-   - 设定 `MAX_CONCURRENT_DOWNLOADS = 2`。即使批量添加 50 个文件，同时在内存中分配缓冲区的任务永远只有 2 个，总内存消耗恒定可控。
-2. **下载落盘后立即内存清零 (Immediate Buffer Discard)**：
-   - 当文件数据流读取完毕，执行落盘保存逻辑后，**立刻执行 `this.chunks.length = 0; this.chunks = null;`**；
-   - 触发的临时 Object URL 在 500ms 内调用 `URL.revokeObjectURL()`，将底层 C++ 绑定的 Blob 句柄直接销毁；
-   - 任务对象只保留轻量状态信息（文件名、大小、完成状态），释放全部大体积二进制引用，杜绝内存累积。
+### 2.1 启动器自动打开网页功能
+1. **Python 智能启动器 (`launcher.py`)**：
+   - 在启动 dufs 进程前，使用标准库 `webbrowser.open(primary_url)` 异步唤起用户系统的默认浏览器；
+   - 优先打开物理局域网 IP（`http://192.168.x.x:5000/`），确保电脑本机直接进入极速网盘首页。
+2. **PowerShell 原生启动器 (`launcher.ps1`)**：
+   - 在启动 dufs 进程前，调用 `Start-Process $primaryUrl` 启动默认浏览器打开局域网访问地址。
 
-### 2.2 UI 节流与局部 DOM 刷新 (Anti-Freezing UI Engine)
-1. **杜绝全量 `innerHTML` 重绘**：
-   - 任务列表项初始化时挂载独立 DOM 节点与元素缓存；
-   - 进度更新时，**只更新当前任务对应节点的进度条宽度（`style.width`）与数值文本**，绝不销毁和重建整个列表 DOM。
-2. **200ms 时间戳节流 (rAF Throttle)**：
-   - 在高速局域网（100MB/s+）下，每个数据包不再触发全量渲染计算，而是通过节流阀限制最大每秒仅更新 5 次 UI，使主线程 CPU 占用率从 90%+ 压降至 1% 以内，界面始终流畅如丝。
-
-### 2.3 真正的网页内嵌暂停与断点续传 (HTTP Range Resumption)
-1. **暂停状态机**：
-   - 点击【暂停】时，立即调用 `reader.cancel()` 与 `abortController.abort()` 释放连接与当前网络流；
-   - 记录已保存的接收偏移量 `receivedBytes`，释放当前连接占用的调度槽位，供其他任务执行；
-2. **继续与断点拉取**：
-   - 点击【继续】时，任务重新排队，获得调度后携带请求头 `Range: bytes=${receivedBytes}-`；
-   - 服务端（dufs）原生响应 `206 Partial Content`，前端继续将后续分块无缝追加，实现真·断点续传。
+### 2.2 核心前端：完整文件夹层级结构上传引擎 (`web/app.js`)
+1. **重构 `UploadTask` 路径模型**：
+   - 读取 `this.relativePath = file.webkitRelativePath || file.relativePath || file.name`；
+   - `this.filename` 显示相对路径（如 `素材/图标/logo.png`），在任务中心让用户一目了然；
+   - `this.targetKey` 采用 `(targetDir + '/' + this.relativePath).toLowerCase()`，防止不同子目录下的同名文件被错误误判为冲突；
+   - `this.targetUrl` 分段编码：
+     ```javascript
+     const segments = this.relativePath.split('/').map(seg => encodeURIComponent(seg)).join('/');
+     this.targetUrl = (targetDir === '/' ? '' : targetDir) + '/' + segments;
+     ```
+2. **升级全屏拖拽上传为目录递归展开**：
+   - 编写递归工具函数 `scanFilesAndFolders(items)`：
+     - 若为文件 Entry，读取 `File` 并注入 `file.relativePath = path`；
+     - 若为目录 Entry，递归读取目录内的所有子条目；
+   - 在 `drop` 事件中优先使用 Entry 递归扫描，拖入任意多层级复杂文件夹均能无损秒级展开为任务队列。
 
 ---
 
@@ -41,20 +48,18 @@
 
 | 阶段 | 编号 | 任务项 | 目标文件 | 详细说明 | 状态 |
 | :--- | :--- | :--- | :--- | :--- | :---: |
-| **阶段 1** | **T1.1** | 重构 `DownloadTask` 为网页纯内置流式下载器 | `web/app.js` | 移除所有 `native=true` 和强制跳向浏览器原生下载的 handoff 代码，恢复纯网页内任务中心控制 | ✅ 已完成 |
-| **阶段 1** | **T1.2** | 实现落盘即销毁的瞬时内存释放机制 | `web/app.js` | 在文件数据下载完毕触发保存后，立即解除 chunks 引用并主动调用 `revokeObjectURL`，内存瞬间归零 | ✅ 已完成 |
-| **阶段 1** | **T1.3** | 完善 `Range: bytes=offset-` 网页内断点续传 | `web/app.js` | 支持在网页内自由暂停与恢复，校验 206 响应状态与 Content-Range 边界，防止数据截断 | ✅ 已完成 |
-| **阶段 2** | **T2.1** | 升级 `TransferManager` 为局部精准 DOM 更新 | `web/app.js` | 淘汰高频 `innerHTML` 全量重构，改为单任务节点进度微更新与 200ms 节流，消除主线程卡顿 | ✅ 已完成 |
-| **阶段 2** | **T2.2** | 实施严格并发数控制调度器 | `web/app.js` | 限制下载并发槽位为 2，支持批量添加任务自动排队与平滑连续调度 | ✅ 已完成 |
-| **阶段 3** | **T3.1** | 编写并执行全功能稳定性自动化闭环测试 | `web/app.js` / Python 测试 | 验证 HTTP 206 断点续传协议、JS 语法编译检查及便携包重新打包 | ✅ 已完成 |
-| **阶段 3** | **T3.2** | 更新文档并同步到 GitHub 仓库 | `README.md` & Git | 提交并推送最新代码至 GitHub 远程主干 `main` | 🔄 进行中 |
+| **阶段 1** | **T1.1** | 启动器增加自动打开浏览器功能 | `launcher.py` | 服务启动时自动使用 `webbrowser.open` 打开主物理局域网地址 | ✅ 已完成 |
+| **阶段 1** | **T1.2** | PowerShell 启动器增加打开网页 | `launcher.ps1` | 服务启动前调用 `Start-Process $primaryUrl` 自动打开浏览器 | ✅ 已完成 |
+| **阶段 2** | **T2.1** | 重构 `UploadTask` 支持相对路径层级 | `web/app.js` | 保留 `webkitRelativePath`，分段 URI 编码拼接 URL，自动由 dufs 创建父目录 | ✅ 已完成 |
+| **阶段 2** | **T2.2** | 升级全屏拖拽支持整目录递归展开 | `web/app.js` | 基于 `webkitGetAsEntry` 递归解析拖入的文件夹，生成带路径的文件列表 | ✅ 已完成 |
+| **阶段 2** | **T2.3** | 升级版本防缓存时间戳 | `web/index.html` | 更新脚本版本戳为 `v=20261026_folder_upload_r1`，确保客户端秒级生效 | ✅ 已完成 |
+| **阶段 3** | **T3.1** | 本地语法与多层级目录上传实测 | 本地测试 | 校验 JS 语法，自检通过，PUT 嵌套路径自动创建父目录机制验证通过 | ✅ 已完成 |
+| **阶段 3** | **T3.2** | 重新打包便携压缩包 | `launcher.ps1` | 重新生成最新便携包 `LAN-Fast-Share-Portable.zip`（保留本地，未推送到 GitHub） | ✅ 已完成 |
 
 ---
 
-## 4. 架构落地与验收结论
+## 4. 预期验收指标
 
-1. **纯网页内置管理**：所有下载任务均在右下角悬浮速度胶囊和侧边栏任务抽屉中统一管理，绝不调用浏览器原生下载接管，用户体验完整一致。
-2. **零泄漏内存保护**：流式下载数据流采用 `new Blob()` 落盘后立即将数组置空 (`chunks.length = 0; chunks = null;`)，生成的 Object URL 在 1000ms 内强制撤销，大文件多文件传输无堆积。
-3. **断点续传**：已实测验证服务端标准 HTTP 206 `Range: bytes=offset-` 响应，暂停后继续无需重新从 0 开始。
-4. **主线程流畅**：高频进度刷新改为局部 DOM `updateTaskProgressDOM` + 200ms 时间戳节流，彻底解决多文件卡顿。
-5. **便携包已同步**：重新生成 `LAN-Fast-Share-Portable.zip` (1.79 MB)。
+1. **自动打开**：双击启动后，电脑默认浏览器立即自动弹出并访问 `http://192.168.3.49:5000/`；
+2. **目录上传**：点击【📁 上传目录】选择一个包含子文件夹的文件树，上传完毕后服务器自动按原目录树结构存放，页面刷新后呈现完整的文件夹层级；
+3. **拖拽支持**：直接将电脑上的文件夹拖拽进网页，自动递归识别所有子目录和文件并完整上传。

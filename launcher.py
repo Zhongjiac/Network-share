@@ -18,6 +18,7 @@ import ipaddress
 import json
 import time
 import signal
+import webbrowser
 from pathlib import Path
 
 # 强制 UTF-8 编码与无缓冲输出
@@ -697,6 +698,16 @@ def main():
 
     # 统一进程管理
     proc = subprocess.Popen(cmd)
+
+    # 自动在默认浏览器中打开局域网物理 IP 的 Web 页面
+    try:
+        import threading
+        def open_browser():
+            time.sleep(0.5)
+            webbrowser.open(primary_url)
+        threading.Thread(target=open_browser, daemon=True).start()
+    except Exception:
+        pass
 
     def clean_exit(signum=None, frame=None):
         print("\n\n正在停止局域网快传核心引擎...")

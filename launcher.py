@@ -703,7 +703,13 @@ def main():
     try:
         import threading
         def open_browser():
-            time.sleep(0.5)
+            # 动态轮询探测服务端口连通性 (最多尝试 30 次，每次 100ms)
+            for _ in range(30):
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.15):
+                        break
+                except Exception:
+                    time.sleep(0.1)
             webbrowser.open(primary_url)
         threading.Thread(target=open_browser, daemon=True).start()
     except Exception:

@@ -79,7 +79,7 @@ def main():
 
         # 提取 Assets Prefix
         import re
-        m = re.search(r'href="(/__dufs_[^/]+__/)style\.css"', html)
+        m = re.search(r'href="(/__dufs_[^/]+__/)style\.css(?:\?[^"]*)?"', html)
         assert m, "未能从 HTML 提取到静态资源前缀"
         assets_prefix = m.group(1)
         print(f"  [+] 检测到静态资源前缀: {assets_prefix}")

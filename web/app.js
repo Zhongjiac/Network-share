@@ -769,6 +769,12 @@
 
         if (cdOffset + cdSize > len) throw new Error('ZIP 压缩包损坏或索引偏移越界');
 
+        const MAX_ZIP_ENTRIES = 1000;
+        const MAX_FILE_SIZE = 500 * 1024 * 1024; // 500MB
+        if (totalEntries > MAX_ZIP_ENTRIES) {
+            throw new Error(`ZIP 压缩包包含条目过多 (${totalEntries} 项，上限 ${MAX_ZIP_ENTRIES} 项)，已拦截`);
+        }
+
         const utf8Decoder = new TextDecoder('utf-8');
         let gbkDecoder = null;
         try { gbkDecoder = new TextDecoder('gbk'); } catch (e) {}
@@ -786,6 +792,7 @@
             const flag = view.getUint16(currentCd + 8, true);
             const method = view.getUint16(currentCd + 10, true);
             const compressedSize = view.getUint32(currentCd + 20, true);
+            const uncompressedSize = view.getUint32(currentCd + 24, true);
             const nameLen = view.getUint16(currentCd + 28, true);
             const extraLen = view.getUint16(currentCd + 30, true);
             const commentLen = view.getUint16(currentCd + 32, true);
@@ -807,6 +814,16 @@
             // 统一路径分隔符并清理首部斜杠
             entryName = entryName.replace(/\\/g, '/').replace(/^\/+/, '');
             currentCd += 46 + nameLen + extraLen + commentLen;
+
+            // 路径安全校验 (拦截 Zip Slip 路径遍历攻击与超限文件)
+            if (entryName.includes('../') || entryName.includes('..\\') || entryName.startsWith('/')) {
+                console.warn(`检测到非法路径跳出条目，已安全过滤: ${entryName}`);
+                continue;
+            }
+            if (uncompressedSize > MAX_FILE_SIZE) {
+                console.warn(`条目 ${entryName} 大小超过 500MB，已跳过`);
+                continue;
+            }
 
             // 剔除 macOS 资源包与纯空目录
             if (entryName.startsWith('__MACOSX/') || entryName.endsWith('/')) {
@@ -1038,6 +1055,19 @@
 
         start() {
             if (this.status !== 'pending' || this.runPromise) return;
+            // 针对超大文件 (大于 50MB)，直接分流交由浏览器原生下载直存磁盘，实现零 JS 内存占用，根除 OOM 闪退
+            const LARGE_FILE_THRESHOLD = 50 * 1024 * 1024;
+            if (this.totalBytes && this.totalBytes > LARGE_FILE_THRESHOLD) {
+                this.status = 'completed';
+                this.receivedBytes = this.totalBytes;
+                triggerDirectNativeDownload(this.filename, this.fileUrl);
+                showToast(`大文件 "${this.filename}" (${formatBytes(this.totalBytes)}) 已由浏览器内核接管直存磁盘`, 'info', 4000);
+                TransferManager.updateTaskProgressDOM(this);
+                TransferManager.onTaskUpdated();
+                TransferManager.scheduleNext();
+                return;
+            }
+
             this.status = 'running';
             this.errorMessage = '';
             this.resumeRequested = false;
@@ -1053,19 +1083,30 @@
             const etag = response.headers.get('ETag');
             const validator = etag && !etag.startsWith('W/') ? { name: 'ETag', value: etag } :
                 response.headers.get('Last-Modified') ? { name: 'Last-Modified', value: response.headers.get('Last-Modified') } : null;
+
+            const LARGE_FILE_THRESHOLD = 50 * 1024 * 1024;
+            // 若首包发现实际长度大于阈值，立即原生交接
+            if (offset === 0 && length !== null && length > LARGE_FILE_THRESHOLD) {
+                this.totalBytes = length;
+                this.receivedBytes = length;
+                this.status = 'completed';
+                triggerDirectNativeDownload(this.filename, this.fileUrl);
+                showToast(`大文件 "${this.filename}" (${formatBytes(length)}) 已由浏览器内核直存磁盘`, 'info', 4000);
+                throw new Error('NATIVE_DOWNLOAD_HANDLED');
+            }
+
             if (offset) {
+                // 校验文件一致性
+                if (this.validator && validator && this.validator.value !== validator.value) {
+                    throw new Error('RESTART_NEEDED');
+                }
                 const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('Content-Range') || '');
-                if (response.status !== 206 || !range || !range.slice(1).every(n => Number.isSafeInteger(Number(n))) || Number(range[1]) !== offset) {
-                    // 若服务器不支持 Range 或文件已变更，清空先前数据，平稳重新开始
-                    this.chunks = [];
-                    this.receivedBytes = 0;
-                    if (length !== null) this.totalBytes = length;
-                    this.validator = validator;
-                    return length;
+                if (response.status === 416 || response.status !== 206 || !range || !range.slice(1).every(n => Number.isSafeInteger(Number(n))) || Number(range[1]) !== offset) {
+                    throw new Error('RESTART_NEEDED');
                 }
                 this.totalBytes = Number(range[3]);
             } else {
-                if (response.status !== 200 && response.status !== 206) throw new Error('下载响应状态不匹配');
+                if (response.status !== 200 && response.status !== 206) throw new Error(`下载响应状态不匹配 (HTTP ${response.status})`);
                 if (length !== null) this.totalBytes = length;
                 this.validator = validator;
             }
@@ -1138,19 +1179,28 @@
 
                 // 触发保存落盘
                 const blobUrl = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.style.display = 'none';
-                a.href = blobUrl;
-                a.download = this.filename;
-                document.body.appendChild(a);
-                a.click();
+                triggerDirectNativeDownload(this.filename, blobUrl);
                 setTimeout(() => {
-                    a.remove();
                     URL.revokeObjectURL(blobUrl);
                 }, 1000);
 
                 this.status = 'completed';
             } catch (error) {
+                if (error.message === 'NATIVE_DOWNLOAD_HANDLED') {
+                    TransferManager.updateTaskProgressDOM(this);
+                    TransferManager.onTaskUpdated();
+                    TransferManager.scheduleNext();
+                    return;
+                }
+                if (error.message === 'RESTART_NEEDED') {
+                    this.chunks = [];
+                    this.receivedBytes = 0;
+                    this.validator = null;
+                    if (current()) {
+                        this.run(generation);
+                        return;
+                    }
+                }
                 if (this.status === 'cancelling') return;
                 if (this.status === 'pausing' && !timedOut) return;
                 this.status = 'error';
@@ -1284,14 +1334,14 @@
         async addDownloadFiles(files) {
             if (!files.length) return;
             this.openDrawer('download');
-            const names = new Set(this.downloadTasks.filter(t => !['completed', 'cancelled'].includes(t.status)).map(t => t.filename.toLowerCase()));
+            const activeUrls = new Set(this.downloadTasks.filter(t => !['completed', 'cancelled'].includes(t.status)).map(t => t.fileUrl.toLowerCase()));
             let skipped = 0;
             let added = 0;
             for (let i = 0; i < files.length; i++) {
                 const file = files[i];
-                const key = file.name.toLowerCase();
-                if (names.has(key)) { skipped++; continue; }
-                names.add(key);
+                const key = (file.url || file.name).toLowerCase();
+                if (activeUrls.has(key)) { skipped++; continue; }
+                activeUrls.add(key);
                 this.addDownloadFile(file.name, file.url, file.size, true);
                 added++;
                 if (i % 100 === 99) {
@@ -1814,18 +1864,17 @@
         tbody.innerHTML = state.filteredItems.slice(directoryPage * DIRECTORY_PAGE_SIZE, (directoryPage + 1) * DIRECTORY_PAGE_SIZE).map((item, pageIndex) => {
             const idx = directoryPage * DIRECTORY_PAGE_SIZE + pageIndex;
             const isDir = (item.path_type === 'Dir' || item.path_type === 'SymlinkDir');
-            const itemPath = (state.currentPath === '/' ? '' : state.currentPath) + '/' + item.name;
             const isSelected = state.selectedPaths.has(item.name);
             const sizeStr = isDir ? '-' : formatBytes(item.size);
             const mtimeStr = formatTime(item.mtime);
             const icon = getFileIcon(item);
 
             return `
-            <tr class="file-row ${isSelected ? 'selected' : ''}" data-name="${escapeHtml(item.name)}" data-index="${idx}">
-                <td class="col-checkbox" onclick="event.stopPropagation()">
-                    <input type="checkbox" class="row-checkbox" ${isSelected ? 'checked' : ''} onchange="window.handleRowSelect('${escapeHtml(item.name)}', ${idx}, event)">
+            <tr class="file-row ${isSelected ? 'selected' : ''}" data-name="${escapeHtml(item.name)}" data-index="${idx}" data-is-dir="${isDir}" data-size="${item.size || 0}">
+                <td class="col-checkbox">
+                    <input type="checkbox" class="row-checkbox" ${isSelected ? 'checked' : ''}>
                 </td>
-                <td class="col-name" onclick="window.handleItemClick('${escapeHtml(item.name)}', ${isDir})">
+                <td class="col-name" data-action="open">
                     <div class="name-cell">
                         <span class="file-icon">${icon}</span>
                         <span class="file-name-text">${escapeHtml(item.name)}</span>
@@ -1833,11 +1882,11 @@
                 </td>
                 <td class="col-size">${sizeStr}</td>
                 <td class="col-mtime">${mtimeStr}</td>
-                <td class="col-actions" onclick="event.stopPropagation()">
-                    ${!isDir ? `<button class="row-action-btn" title="加入传输任务中心下载" onclick="window.triggerDownload('${escapeHtml(item.name)}', ${item.size})">⬇ 下载</button>` : ''}
-                    ${isDir ? `<button class="row-action-btn" title="打包 Zip 下载" onclick="window.triggerZipDownload('${escapeHtml(item.name)}')">📦 打包</button>` : ''}
-                    <button class="row-action-btn" title="重命名" onclick="window.triggerRename('${escapeHtml(item.name)}')">✏️</button>
-                    <button class="row-action-btn delete" title="删除" onclick="window.triggerDelete('${escapeHtml(item.name)}')">🗑️</button>
+                <td class="col-actions">
+                    ${!isDir ? `<button class="row-action-btn" data-action="download" title="加入传输任务中心下载">⬇ 下载</button>` : ''}
+                    ${isDir ? `<button class="row-action-btn" data-action="zip" title="打包 Zip 下载">📦 打包</button>` : ''}
+                    <button class="row-action-btn" data-action="rename" title="重命名">✏️</button>
+                    <button class="row-action-btn delete" data-action="delete" title="删除">🗑️</button>
                 </td>
             </tr>`;
         }).join('');
@@ -1855,15 +1904,15 @@
             const itemUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/' + encodeURIComponent(item.name);
 
             return `
-            <div class="grid-card ${isSelected ? 'selected' : ''}" onclick="window.handleItemClick('${escapeHtml(item.name)}', ${isDir})" data-name="${escapeHtml(item.name)}">
-                <input type="checkbox" class="grid-checkbox" ${isSelected ? 'checked' : ''} onclick="event.stopPropagation()" onchange="window.handleRowSelect('${escapeHtml(item.name)}', ${idx}, event)">
-                <div class="grid-thumb-box">
+            <div class="grid-card ${isSelected ? 'selected' : ''}" data-name="${escapeHtml(item.name)}" data-index="${idx}" data-is-dir="${isDir}" data-size="${item.size || 0}">
+                <input type="checkbox" class="grid-checkbox" ${isSelected ? 'checked' : ''}>
+                <div class="grid-thumb-box" data-action="open">
                     ${isImg 
                         ? `<img class="grid-thumb-img" src="${itemUrl}" alt="" loading="lazy">` 
                         : `<span class="grid-icon">${icon}</span>`
                     }
                 </div>
-                <div class="grid-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</div>
+                <div class="grid-name" data-action="open" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</div>
                 <div class="grid-meta">${sizeStr}</div>
             </div>`;
         }).join('');
@@ -1922,6 +1971,71 @@
         // 同步全选 Checkbox 状态
         const selectAllCb = document.getElementById('selectAllCheckbox');
         selectAllCb.checked = (state.filteredItems.length > 0 && state.selectedPaths.size === state.filteredItems.length);
+    }
+
+    /**
+     * @brief 列表与网格视图事件委托控制器，消灭行内内联事件与单引号语法注入
+     */
+    function setupFileViewDelegation() {
+        const listBody = document.getElementById('fileTableBody');
+        const gridContainer = document.getElementById('gridItemsContainer');
+
+        const handleAction = (target, event) => {
+            const row = target.closest('[data-name]');
+            if (!row) return;
+            const name = row.dataset.name;
+            const isDir = row.dataset.isDir === 'true';
+            const size = Number(row.dataset.size) || 0;
+            const actionBtn = target.closest('[data-action]');
+            const action = actionBtn ? actionBtn.dataset.action : null;
+
+            if (action === 'download') {
+                event.stopPropagation();
+                window.triggerDownload(name, size);
+            } else if (action === 'zip') {
+                event.stopPropagation();
+                window.triggerZipDownload(name);
+            } else if (action === 'rename') {
+                event.stopPropagation();
+                window.triggerRename(name);
+            } else if (action === 'delete') {
+                event.stopPropagation();
+                window.triggerDelete(name);
+            } else if (action === 'open') {
+                window.handleItemClick(name, isDir);
+            }
+        };
+
+        if (listBody) {
+            listBody.addEventListener('click', (e) => {
+                if (e.target.closest('.row-checkbox') || e.target.closest('.col-checkbox')) return;
+                handleAction(e.target, e);
+            });
+            listBody.addEventListener('change', (e) => {
+                const checkbox = e.target.closest('.row-checkbox');
+                if (!checkbox) return;
+                const row = checkbox.closest('[data-name]');
+                if (!row) return;
+                window.handleRowSelect(row.dataset.name, Number(row.dataset.index), e);
+            });
+        }
+
+        if (gridContainer) {
+            gridContainer.addEventListener('click', (e) => {
+                if (e.target.closest('.grid-checkbox')) return;
+                const card = e.target.closest('[data-name]');
+                if (!card) return;
+                const isDir = card.dataset.isDir === 'true';
+                window.handleItemClick(card.dataset.name, isDir);
+            });
+            gridContainer.addEventListener('change', (e) => {
+                const checkbox = e.target.closest('.grid-checkbox');
+                if (!checkbox) return;
+                const card = checkbox.closest('[data-name]');
+                if (!card) return;
+                window.handleRowSelect(card.dataset.name, Number(card.dataset.index), e);
+            });
+        }
     }
 
     // ==========================================================================
@@ -2138,6 +2252,9 @@
         gridBtn.onclick = () => setViewMode('grid');
         setViewMode(state.viewMode);
 
+        // 视图行内与网格事件集中委托绑定 (免疫特殊文件名注入)
+        setupFileViewDelegation();
+
         // 3. 排序绑定
         const sortSelect = document.getElementById('sortSelect');
         sortSelect.value = state.sortBy;
@@ -2201,24 +2318,41 @@
         };
 
         document.getElementById('batchZipBtn').onclick = () => {
-            const targetUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/?zip';
-            window.open(targetUrl, '_blank');
+            openConfirmModal('打包整目录', '服务端仅支持打包当前整个目录（非仅选中项），确定要打包下载当前目录所有内容吗？', () => {
+                const targetUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/?zip';
+                window.open(targetUrl, '_blank');
+            });
         };
 
         document.getElementById('batchDeleteBtn').onclick = () => {
             const count = state.selectedPaths.size;
-            openConfirmModal('批量删除', `确定要彻底删除选中的 ${count} 个项目吗？`, async () => {
+            openConfirmModal('批量删除', `确定要彻底删除选中的 ${count} 个项目吗？此操作无法撤销。`, async () => {
                 const names = Array.from(state.selectedPaths);
-                state.selectedPaths.clear();
-                updateBatchDock();
+                let successCount = 0;
+                let failCount = 0;
 
                 for (const name of names) {
                     const targetUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/' + encodeURIComponent(name);
                     try {
-                        await fetch(targetUrl, { method: 'DELETE' });
-                    } catch (e) {}
+                        const res = await fetch(targetUrl, { method: 'DELETE' });
+                        if (res.ok) {
+                            successCount++;
+                            state.selectedPaths.delete(name);
+                        } else {
+                            failCount++;
+                        }
+                    } catch (e) {
+                        failCount++;
+                    }
                 }
-                showToast(`已完成批量删除 ${count} 项`, 'success');
+                updateBatchDock();
+                if (failCount === 0) {
+                    showToast(`已成功删除全部 ${successCount} 项`, 'success');
+                } else if (successCount > 0) {
+                    showToast(`删除完成：成功 ${successCount} 项，失败 ${failCount} 项（已保留失败项勾选）`, 'error');
+                } else {
+                    showToast(`批量删除失败 (${failCount} 项未能删除，请检查写权限)`, 'error');
+                }
                 loadDirectory(state.currentPath, false);
             });
         };

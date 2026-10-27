@@ -1,4 +1,4 @@
-﻿# ==============================================================================
+# ==============================================================================
 # LAN Fast Share - Windows 原生零依赖启动器 (PowerShell 5.1/7+ 兼容)
 # 无需安装任何 Python 或第三方依赖，开箱即用满血运行
 # ==============================================================================
@@ -531,10 +531,29 @@ if ($sharedDir -eq $DefaultSharedDir) {
     } catch {}
 }
 
-# 自动在默认浏览器中打开局域网物理 IP 的 Web 页面
+# 异步轮询探测端口就绪后在默认浏览器中打开 Web 页面 (最多尝试 30 次，每次 100ms)
 try {
-    Start-Process $primaryUrl
-} catch {}
+    Start-Job -ScriptBlock {
+        param($TargetPort, $TargetUrl)
+        for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Milliseconds 100
+            try {
+                $client = New-Object System.Net.Sockets.TcpClient
+                $asyncResult = $client.BeginConnect("127.0.0.1", $TargetPort, $null, $null)
+                if ($asyncResult.AsyncWaitHandle.WaitOne(150)) {
+                    $client.EndConnect($asyncResult)
+                    $client.Close()
+                    Start-Process $TargetUrl
+                    break
+                }
+                $client.Close()
+            } catch {}
+        }
+    } -ArgumentList $port, $primaryUrl | Out-Null
+} catch {
+    # 兜底：若后台作业创建受限，则直接启动
+    try { Start-Process $primaryUrl } catch {}
+}
 
 Write-Host "[*] 核心引擎已启动，按 Ctrl+C 可停止分享并退出服务...`n" -ForegroundColor Green
 

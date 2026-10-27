@@ -162,15 +162,16 @@ lan-fast-share/
 ### 验证方式
 
 ```powershell
+# 1. 语法检查
 node --check web/app.js
-node test_transfers.cjs
-node test_download_stream.cjs
-node benchmark_streaming.cjs
-python benchmark_stability.py
+
+# 2. 现代化前端与传输协议自动化闭环实测 (静态资源/JSON/断点续传/MKCOL/DELETE)
+python benchmark_web.py
+
+# 3. 局域网全双工吞吐速率与传输闭环测试 (50MB 端到端完整性)
+python benchmark_test.py
 ```
 
-当前 6 项上传/队列回归和 21 项流式下载回归全部通过。`benchmark_streaming.cjs` 直接执行生产 DownloadTask，通过 Node 文件句柄适配器连接真实 dufs HTTP 并写入真实磁盘：1 GiB 文件与 30 个小文件并发完成，中途暂停/继续，全部 SHA-256 一致；复用同一写入流，最多 3 个同时写入。它不是浏览器文件选择器的端到端测试。
-
-测试脚本可按上述命令重新运行。临时计划、报告、截图和结果快照已清理；压测脚本运行时会重新生成结果 JSON。前次 1 GiB / 300 小文件协议压测通过，但不作为浏览器直接写盘的实测证明。
+`benchmark_web.py` 自动化覆盖 `--assets` 模板注入、静态资源加载、`/?json` 接口、20MB 文件断点续传（PUT+HEAD+PATCH append）、Range 断点续传下载与 SHA-256 校验、MKCOL 目录新建及 DELETE 批量清理。`benchmark_test.py` 覆盖真实网络环境下的上传与下载全闭环及吞吐速率统计。
 
 **更新后先重启快传服务，再按 Ctrl+F5 刷新网页。** dufs 在启动时载入自定义资产，仅刷新浏览器可能仍拿到旧脚本。尚未覆盖所有浏览器、手机、真实弱网、磁盘故障和长时间运行；磁盘接口本身若长期不返回，程序会等待在途写入，不能强制终止浏览器/操作系统的磁盘 I/O。

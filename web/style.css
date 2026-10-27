@@ -1319,3 +1319,70 @@ body {
     .batch-dock { width: 92%; justify-content: space-between; padding: 8px 16px; }
     .col-size, .col-mtime { display: none; }
 }
+
+/* 移动端目录上传助手弹窗 */
+.mobile-folder-dialog {
+    max-width: 520px;
+}
+.mobile-folder-tip {
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--text-secondary);
+    margin-bottom: 16px;
+    padding: 10px 14px;
+    background: var(--bg-surface);
+    border-radius: var(--radius-md);
+    border-left: 3px solid var(--primary);
+}
+.mobile-upload-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+.mobile-card {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding: 14px 16px;
+    background: var(--bg-surface);
+    border: 1.5px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    cursor: pointer;
+    transition: all var(--transition-fast);
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+}
+.mobile-card:hover {
+    border-color: var(--primary);
+    background: var(--bg-surface-elevated);
+    transform: translateY(-1px);
+    box-shadow: var(--shadow-md);
+}
+.mobile-card:active {
+    transform: scale(0.985);
+    border-color: var(--primary);
+    background: rgba(37, 99, 235, 0.06);
+}
+.mobile-card-icon {
+    font-size: 26px;
+    flex-shrink: 0;
+    line-height: 1;
+    margin-top: 2px;
+}
+.mobile-card-info {
+    flex: 1;
+}
+.mobile-card-title {
+    font-size: 14.5px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.mobile-card-desc {
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+}

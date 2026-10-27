@@ -712,6 +712,147 @@
 
     // ==========================================================================
     // 4. 传输任务中心引擎 (Transfer Manager)
+    /**
+     * @brief 清洗并规范化相对路径，防御性剥离 Android SAF 畸变前缀与 Windows 非法字符
+     * @param {File} file 待上传的文件对象
+     * @return {string} 干净、合法的相对路径
+     */
+    function sanitizeRelativePath(file) {
+        let raw = file.webkitRelativePath || file.relativePath || file.name || 'unnamed';
+        // 1. 若包含 URL 编码字符（如 primary%3A），安全解码
+        if (raw.includes('%')) {
+            try { raw = decodeURIComponent(raw); } catch (e) {}
+        }
+        // 2. 剥离 Android SAF 与 Linux 挂载路径特有前缀 (如 primary:, content:, /storage/emulated/0/ 等)
+        raw = raw.replace(/^.*(?::|%3A|\/storage\/emulated\/\d+\/)/i, '');
+        // 3. 统一斜杠并清理首尾斜杠
+        raw = raw.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/^\/+|\/+$/g, '');
+        // 4. 清理每个路径段中的 Windows 非法字符 (如冒号、星号、问号等)
+        const segments = raw.split('/').map(seg => seg.replace(/[:*?"<>|]/g, '_').trim()).filter(Boolean);
+        raw = segments.join('/');
+        if (!raw) raw = file.name || 'unnamed';
+        return raw;
+    }
+
+    /**
+     * @brief 检测当前客户端是否为移动端设备（手机、平板或触摸设备）
+     * @return {boolean} 是否为移动端
+     */
+    function isMobileDevice() {
+        return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && window.innerWidth < 1024);
+    }
+
+    /**
+     * @brief 利用现代浏览器原生 Web Streams API (DecompressionStream) 解析 ZIP 目录树
+     * @param {File} file 待解压的 ZIP 压缩包
+     * @return {Promise<File[]>} 包含相对路径的解压文件对象列表
+     */
+    async function unpackZipEntries(file) {
+        const buffer = await file.arrayBuffer();
+        const view = new DataView(buffer);
+        const len = buffer.byteLength;
+        if (len < 22) throw new Error('无效的 ZIP 压缩包：文件数据过小');
+
+        // 1. 定位 End of Central Directory (EOCD, 0x06054b50)
+        let eocdOffset = -1;
+        for (let i = len - 22; i >= Math.max(0, len - 65557); i--) {
+            if (view.getUint32(i, true) === 0x06054b50) {
+                eocdOffset = i;
+                break;
+            }
+        }
+        if (eocdOffset === -1) throw new Error('无法解析 ZIP 压缩包：未找到中央目录索引');
+
+        const totalEntries = view.getUint16(eocdOffset + 10, true);
+        const cdSize = view.getUint32(eocdOffset + 12, true);
+        const cdOffset = view.getUint32(eocdOffset + 16, true);
+
+        if (cdOffset + cdSize > len) throw new Error('ZIP 压缩包损坏或索引偏移越界');
+
+        const utf8Decoder = new TextDecoder('utf-8');
+        let gbkDecoder = null;
+        try { gbkDecoder = new TextDecoder('gbk'); } catch (e) {}
+
+        let currentCd = cdOffset;
+        const extractedFiles = [];
+
+        if (typeof DecompressionStream === 'undefined') {
+            throw new Error('当前浏览器环境不支持原生流式解压，请升级 Chrome/Edge/Safari 浏览器');
+        }
+
+        for (let i = 0; i < totalEntries && currentCd < cdOffset + cdSize; i++) {
+            if (view.getUint32(currentCd, true) !== 0x02014b50) break;
+
+            const flag = view.getUint16(currentCd + 8, true);
+            const method = view.getUint16(currentCd + 10, true);
+            const compressedSize = view.getUint32(currentCd + 20, true);
+            const nameLen = view.getUint16(currentCd + 28, true);
+            const extraLen = view.getUint16(currentCd + 30, true);
+            const commentLen = view.getUint16(currentCd + 32, true);
+            const localHeaderOffset = view.getUint32(currentCd + 42, true);
+
+            const nameBytes = new Uint8Array(buffer, currentCd + 46, nameLen);
+            const isUtf8 = (flag & 0x0800) !== 0;
+            let entryName = '';
+            if (isUtf8) {
+                entryName = utf8Decoder.decode(nameBytes);
+            } else {
+                try {
+                    entryName = gbkDecoder ? gbkDecoder.decode(nameBytes) : utf8Decoder.decode(nameBytes);
+                } catch (e) {
+                    entryName = utf8Decoder.decode(nameBytes);
+                }
+            }
+
+            // 统一路径分隔符并清理首部斜杠
+            entryName = entryName.replace(/\\/g, '/').replace(/^\/+/, '');
+            currentCd += 46 + nameLen + extraLen + commentLen;
+
+            // 剔除 macOS 资源包与纯空目录
+            if (entryName.startsWith('__MACOSX/') || entryName.endsWith('/')) {
+                continue;
+            }
+
+            // 读取 Local File Header 获取压缩数据偏移
+            if (localHeaderOffset + 30 > len) continue;
+            if (view.getUint32(localHeaderOffset, true) !== 0x04034b50) continue;
+
+            const localNameLen = view.getUint16(localHeaderOffset + 26, true);
+            const localExtraLen = view.getUint16(localHeaderOffset + 28, true);
+            const dataStart = localHeaderOffset + 30 + localNameLen + localExtraLen;
+            if (dataStart + compressedSize > len) continue;
+
+            const compressedSlice = file.slice(dataStart, dataStart + compressedSize);
+            let uncompressedBlob = null;
+
+            if (method === 0) {
+                // STORE (未压缩)
+                uncompressedBlob = compressedSlice;
+            } else if (method === 8) {
+                // DEFLATE 压缩
+                try {
+                    const ds = new DecompressionStream('deflate-raw');
+                    const stream = compressedSlice.stream().pipeThrough(ds);
+                    uncompressedBlob = await new Response(stream).blob();
+                } catch (err) {
+                    console.warn(`解压 ${entryName} 失败:`, err);
+                    continue;
+                }
+            } else {
+                continue;
+            }
+
+            const fileNameOnly = entryName.split('/').pop();
+            const extracted = new File([uncompressedBlob], fileNameOnly, { type: 'application/octet-stream' });
+            extracted.relativePath = entryName;
+            extractedFiles.push(extracted);
+        }
+
+        return extractedFiles;
+    }
+
+    // ==========================================================================
+    // 4. 传输任务中心引擎 (Transfer Manager)
     // ==========================================================================
     // 上传按固定大小分段；下载使用有背压的文件流，不保留整文件缓冲。
     const TRANSFER_LIMITS = Object.freeze({ chunkBytes: 8 * 1024 * 1024,
@@ -722,8 +863,8 @@
             this.id = 'up_' + Math.random().toString(36).slice(2);
             this.file = file;
             this.targetDir = targetDir;
-            // 提取并清理相对路径（去除首尾斜杠），完美保留文件夹层级
-            const rawRelative = (file.webkitRelativePath || file.relativePath || file.name).replace(/^[\/\\]+/, '').replace(/\\/g, '/');
+            // 提取并清洗相对路径（防御性剔除 Android SAF 畸变前缀、非法冒号与首尾斜杠），完美保留文件夹层级
+            const rawRelative = sanitizeRelativePath(file);
             this.relativePath = rawRelative;
             this.filename = rawRelative;
             this.targetKey = (targetDir + '/' + rawRelative).toLowerCase();
@@ -2085,8 +2226,51 @@
         // 8. 核心按钮: 上传文件与上传目录
         const fileInput = document.getElementById('hiddenFileInput');
         const folderInput = document.getElementById('hiddenFolderInput');
+        const zipFolderInput = document.getElementById('hiddenZipFolderInput');
+        const multiFileInput = document.getElementById('hiddenFolderMultiFileInput');
+
         document.getElementById('uploadFileBtn').onclick = () => fileInput.click();
-        document.getElementById('uploadFolderBtn').onclick = () => folderInput.click();
+
+        // 移动端/桌面端自适应目录上传路由
+        let targetCategoryFolderName = '';
+        function openMobileFolderModal() {
+            const modal = document.getElementById('mobileFolderModal');
+            modal.classList.add('active');
+            const close = () => modal.classList.remove('active');
+            document.getElementById('mobileFolderClose').onclick = close;
+            document.getElementById('mobileFolderCancelBtn').onclick = close;
+
+            // 通道 A: 多文件归入新文件夹
+            document.getElementById('mobileOptMultiFile').onclick = () => {
+                close();
+                const defaultName = '新建文件夹_' + new Date().toISOString().slice(0, 10).replace(/-/g, '');
+                openPromptModal('新建目录归类上传', defaultName, (folderName) => {
+                    if (!folderName) return;
+                    targetCategoryFolderName = folderName;
+                    multiFileInput.click();
+                });
+            };
+
+            // 通道 B: ZIP 压缩包解压上传
+            document.getElementById('mobileOptZip').onclick = () => {
+                close();
+                zipFolderInput.click();
+            };
+
+            // 通道 C: 尝试调用系统原生目录选择器
+            document.getElementById('mobileOptNative').onclick = () => {
+                close();
+                folderInput.click();
+            };
+        }
+
+        document.getElementById('uploadFolderBtn').onclick = () => {
+            if (isMobileDevice()) {
+                openMobileFolderModal();
+            } else {
+                folderInput.click();
+            }
+        };
 
         fileInput.onchange = () => {
             if (fileInput.files.length > 0) {
@@ -2098,6 +2282,40 @@
             if (folderInput.files.length > 0) {
                 TransferManager.addUploadFiles(folderInput.files, state.currentPath);
                 folderInput.value = '';
+            }
+        };
+
+        // 移动端专用多文件归入新目录选择响应
+        multiFileInput.onchange = () => {
+            if (multiFileInput.files.length > 0 && targetCategoryFolderName) {
+                const folderName = targetCategoryFolderName;
+                targetCategoryFolderName = '';
+                const fileList = Array.from(multiFileInput.files);
+                fileList.forEach(f => {
+                    f.relativePath = folderName + '/' + f.name;
+                });
+                TransferManager.addUploadFiles(fileList, state.currentPath);
+                multiFileInput.value = '';
+            }
+        };
+
+        // 移动端专用 ZIP 压缩包解压还原目录树
+        zipFolderInput.onchange = async () => {
+            if (zipFolderInput.files.length > 0) {
+                const zipFile = zipFolderInput.files[0];
+                zipFolderInput.value = '';
+                showToast(`正在解析 ZIP: ${zipFile.name} ...`, 'info', 4000);
+                try {
+                    const extractedFiles = await unpackZipEntries(zipFile);
+                    if (!extractedFiles || extractedFiles.length === 0) {
+                        showToast('ZIP 压缩包中未检测到有效文件', 'error');
+                        return;
+                    }
+                    showToast(`已从 ZIP 还原 ${extractedFiles.length} 项文件并加入上传队列`, 'success');
+                    TransferManager.addUploadFiles(extractedFiles, state.currentPath);
+                } catch (err) {
+                    showToast(`ZIP 解析失败: ${err.message}`, 'error');
+                }
             }
         };
 

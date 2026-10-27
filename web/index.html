@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>LAN Fast Share - 局域网极速快传</title>
-    <link rel="stylesheet" href="__ASSETS_PREFIX__style.css?v=20261026_folder_upload_r1">
+    <link rel="stylesheet" href="__ASSETS_PREFIX__style.css?v=20261027_android_folder_r1">
     <script>
         const __RAW_INDEX__ = "__INDEX_DATA__";
         const __RAW_PATH__ = "__PATH_PREFIX__";
@@ -307,15 +307,56 @@
         </div>
     </div>
 
+    <!-- 移动端目录上传助手弹窗 -->
+    <div class="modal-overlay" id="mobileFolderModal">
+        <div class="modal-dialog mobile-folder-dialog">
+            <div class="modal-header">
+                <h3>📁 手机端目录上传助手</h3>
+                <button class="modal-close" id="mobileFolderClose">✕</button>
+            </div>
+            <div class="modal-body">
+                <p class="mobile-folder-tip">由于安卓系统的安全沙盒限制，手机自带文件管理器通常无法直接选中“文件夹对象”。请选择您最方便的上传方式：</p>
+                <div class="mobile-upload-cards">
+                    <div class="mobile-card" id="mobileOptMultiFile">
+                        <div class="mobile-card-icon">📂</div>
+                        <div class="mobile-card-info">
+                            <div class="mobile-card-title">多文件归入新文件夹（推荐）</div>
+                            <div class="mobile-card-desc">输入一个文件夹名，直接多选手机内的照片/视频/文档，自动整理归档上传到该文件夹中。</div>
+                        </div>
+                    </div>
+                    <div class="mobile-card" id="mobileOptZip">
+                        <div class="mobile-card-icon">📦</div>
+                        <div class="mobile-card-info">
+                            <div class="mobile-card-title">选择 ZIP 压缩包并自动展开</div>
+                            <div class="mobile-card-desc">在手机自带“文件管理”中长按文件夹【压缩为ZIP】，上传该压缩包，将在电脑端自动完整还原所有层级目录。</div>
+                        </div>
+                    </div>
+                    <div class="mobile-card" id="mobileOptNative">
+                        <div class="mobile-card-icon">⚡</div>
+                        <div class="mobile-card-info">
+                            <div class="mobile-card-title">尝试调用系统原生目录选择器</div>
+                            <div class="mobile-card-desc">部分新版 Chrome/Edge 支持直接调用安卓系统的目录选择权限。</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="mobileFolderCancelBtn">取消</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Toast 消息通知容器 -->
     <div class="toast-container" id="toastContainer"></div>
 
     <!-- 隐藏的文件/目录选择器 -->
     <input type="file" id="hiddenFileInput" multiple style="display:none;">
-    <input type="file" id="hiddenFolderInput" webkitdirectory style="display:none;">
+    <input type="file" id="hiddenFolderInput" webkitdirectory directory multiple style="display:none;">
+    <input type="file" id="hiddenZipFolderInput" accept=".zip,application/zip,application/x-zip-compressed" style="display:none;">
+    <input type="file" id="hiddenFolderMultiFileInput" multiple style="display:none;">
 
     <!-- 核心驱动脚本 (带版本防缓存戳，保证浏览器秒级加载最新引擎) -->
-    <script src="__ASSETS_PREFIX__qrcode.min.js?v=20261026_folder_upload_r1"></script>
-    <script src="__ASSETS_PREFIX__app.js?v=20261026_folder_upload_r1"></script>
+    <script src="__ASSETS_PREFIX__qrcode.min.js?v=20261027_android_folder_r1"></script>
+    <script src="__ASSETS_PREFIX__app.js?v=20261027_android_folder_r1"></script>
 </body>
 </html>

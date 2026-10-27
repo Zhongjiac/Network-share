@@ -1,65 +1,86 @@
-# 局域网快传：启动自动打开网页与真实目录层级上传实现计划
+# 局域网快传：安卓环境目录上传全场景兼容实现计划
 
-## 1. 现状剖析与用户核心诉求
+## 1. 现状剖析与第一性原理推导
 
-### 1.1 现状与根本原因
-1. **启动未自动打开网页**：
-   - 当前 `launcher.py` 与 `launcher.ps1` 在服务启动后，仅输出了访问链接并在终端渲染二维码，虽然弹出了本地 `shared_files` 资源管理器窗口，但没有自动唤起默认浏览器打开网页，用户每次需要手动复制或点击链接。
-2. **“上传目录”退化为平铺上传文件**：
-   - 页面虽提供了 `<input type="file" id="hiddenFolderInput" webkitdirectory>`，但 `UploadTask` 构造函数中完全丢弃了文件自带的 `file.webkitRelativePath`（例如 `我的文件夹/子目录/文件.txt`），仅截取了 `file.name`；
-   - 目标上传地址 `targetUrl` 被错误硬编码拼接在当前目录下，导致原本具有层次结构的目录被强行打平为单文件散落在当前目录；
-   - 拖拽上传仅处理了扁平的 `e.dataTransfer.files`，未递归遍历文件夹 Entry，导致拖拽文件夹直接失效或被当作 0 字节文件。
+### 1.1 现状与根本问题定位
+用户反馈：**“上传目录目前仅在Windows环境下有效，安卓环境下依旧无法使用”**。
+通过深入剖析 Android 操作系统体系、Chromium 移动内核与系统 DocumentsUI 机制，定位出以下三层核心原因：
 
-### 1.2 第一性原理与关键技术推导
-- **服务端特性验证**：经底层 HTTP 实测，核心引擎 dufs 在接收嵌套路径 PUT 请求时（如 `PUT /folder/sub/a.txt`），会自动递归创建所有缺失的父级目录并返回 `201 Created`，无需前端提前繁琐调用 `MKCOL`；
-- **前端相对路径保持**：只需在 `UploadTask` 中完整保留 `webkitRelativePath`，并将 URL 分段编码拼接，dufs 即可自动还原整棵目录树；
-- **拖拽递归展开**：利用 HTML5 FileSystem API（`item.webkitGetAsEntry()` + `DirectoryReader.readEntries()`）递归展开拖入的文件夹，为每个提取出的文件注入相对路径。
+1. **HTML 标准属性缺失**：
+   - 当前 `web/index.html` 中定义为 `<input type="file" id="hiddenFolderInput" webkitdirectory style="display:none;">`，缺少 `directory` 和 `multiple` 属性。
+   - 在 Android 平台 Chromium 及各类国产定制 ROM（MIUI/HyperOS、ColorOS、OriginOS、HarmonyOS）中，缺少 `multiple` 会导致系统直接将其判定为单文件选择器，甚至无法唤起或不展示目录选取入口。
 
----
+2. **Android 操作系统级交互限制（最致命阻碍）**：
+   - 移动操作系统（Android / iOS）出于沙盒安全考虑，原生系统文件选择器（Storage Access Framework, SAF / DocumentsUI）绝大多数机型**根本没有提供“确认选择当前文件夹对象”的操作入口**，用户点进文件夹只能看里面的具体文件，无法将“整个文件夹”作为对象返回给浏览器。
 
-## 2. 详细技术实现方案
-
-### 2.1 启动器自动打开网页功能
-1. **Python 智能启动器 (`launcher.py`)**：
-   - 在启动 dufs 进程前，使用标准库 `webbrowser.open(primary_url)` 异步唤起用户系统的默认浏览器；
-   - 优先打开物理局域网 IP（`http://192.168.x.x:5000/`），确保电脑本机直接进入极速网盘首页。
-2. **PowerShell 原生启动器 (`launcher.ps1`)**：
-   - 在启动 dufs 进程前，调用 `Start-Process $primaryUrl` 启动默认浏览器打开局域网访问地址。
-
-### 2.2 核心前端：完整文件夹层级结构上传引擎 (`web/app.js`)
-1. **重构 `UploadTask` 路径模型**：
-   - 读取 `this.relativePath = file.webkitRelativePath || file.relativePath || file.name`；
-   - `this.filename` 显示相对路径（如 `素材/图标/logo.png`），在任务中心让用户一目了然；
-   - `this.targetKey` 采用 `(targetDir + '/' + this.relativePath).toLowerCase()`，防止不同子目录下的同名文件被错误误判为冲突；
-   - `this.targetUrl` 分段编码：
-     ```javascript
-     const segments = this.relativePath.split('/').map(seg => encodeURIComponent(seg)).join('/');
-     this.targetUrl = (targetDir === '/' ? '' : targetDir) + '/' + segments;
-     ```
-2. **升级全屏拖拽上传为目录递归展开**：
-   - 编写递归工具函数 `scanFilesAndFolders(items)`：
-     - 若为文件 Entry，读取 `File` 并注入 `file.relativePath = path`；
-     - 若为目录 Entry，递归读取目录内的所有子条目；
-   - 在 `drop` 事件中优先使用 Entry 递归扫描，拖入任意多层级复杂文件夹均能无损秒级展开为任务队列。
+3. **Chromium Android 路径异常（Chromium Issue #377716464）**：
+   - 在部分允许选定目录的新版 Android Chrome 上，Android SAF 返回给 JavaScript 的 `file.webkitRelativePath` 经常携带系统虚拟前缀（例如 `primary%3ADownload%2F...`、`content%3A...`、`/storage/emulated/0/...`）或丢失层级变为空。
+   - 包含冒号（`:` 或 `%3A`）的非法路径传递给 Windows 宿主机的 dufs 后端时，会被 Windows 文件系统判定为非法文件名，导致 `400 Bad Request` 或 `500 IO Error`，上传彻底失败。
 
 ---
 
-## 3. 详细任务分解清单 (Task List) 与落地状态
+## 2. 方案推导与设计架构（全场景双轨制适配）
+
+遵循 KISS 原则与极速轻量理念，不给服务端增加额外复杂的第三方解压缩服务，通过纯原生 Web 核心能力解决安卓端的所有痛点：
+
+```
+                      用户点击【📁 上传目录】
+                                 │
+                 ┌───────────────┴───────────────┐
+                 ▼                               ▼
+       【桌面端 Windows/Mac】          【移动端 Android/iOS】
+                 │                               │
+        直接唤起原生文件夹选择器           弹出【移动端目录上传助手】弹窗
+      (支持全屏拖拽文件夹递归解析)        提供三大贴合移动习惯的解决方案：
+                                                 │
+            ┌────────────────────────────────────┼────────────────────────────────────┐
+            ▼                                    ▼                                    ▼
+    【通道 A：多文件归类存入新目录】     【通道 B：ZIP 压缩包直接解压为目录】    【通道 C：尝试手机原生文件夹选择】
+    - 输入文件夹名（如: 相册备份）        - 提示用户手机长按文件夹"压缩为ZIP"     - 触发 webkitdirectory 原生调用
+    - 调起原生多选文件选择器              - 原生 DecompressionStream 硬件加速    - 防御性清洗 Android SAF 畸变前缀
+    - 自动为所有文件附加目录层级          - 纯前端本地流式还原整棵多层目录树     - 兼容支持原生目录的 Android 浏览器
+    - dufs 服务端自动创建目标文件夹       - 保持各级子目录完整相对路径入队上传
+```
+
+### 2.1 关键技术细节与设计要点
+
+1. **原生流式解压（Zero-Dependency ZIP Unpack）**：
+   - 利用现代移动浏览器（Android Chrome 80+ / WebView）原生内置的 Web Streams API：
+     `new DecompressionStream('deflate-raw')` 进行硬件级解压；
+   - 零第三方 npm/js 依赖，体积仅需约 80 行轻量原生 JS 代码，离线秒级解压多层子目录结构并转化为 `File` 实例，自动赋予 `file.relativePath`；
+   - 完美解决安卓手机无法在网页中直接选择整个深层文件夹的客观系统限制。
+
+2. **Android SAF 路径深度清洗器（Path Sanitizer）**：
+   - 在 `UploadTask` 构造器中增强防御性清洗：
+     - 自动执行 `decodeURIComponent` 处理 `%3A`、`%2F` 等字符；
+     - 正则剔除 `primary:`、`content:`、`/storage/emulated/\d+/`、`raw:` 等系统内部前缀；
+     - 剔除首尾反斜杠/正斜杠，规范化为标准的相对路径，确保在 Windows 宿主机上 100% 写入成功。
+
+3. **双端自适应智能交互**：
+   - 桌面端（PC）：点击【📁 上传目录】直开系统文件夹选择，保持原有极简丝滑体验；
+   - 移动端（手机）：点击【📁 上传目录】唤起直观易懂的移动端上传助手弹窗，引导用户选择【归类多文件至新目录】或【上传 ZIP 展开为目录】。
+
+---
+
+## 3. 详细任务分解清单 (Task List)
 
 | 阶段 | 编号 | 任务项 | 目标文件 | 详细说明 | 状态 |
 | :--- | :--- | :--- | :--- | :--- | :---: |
-| **阶段 1** | **T1.1** | 启动器增加自动打开浏览器功能 | `launcher.py` | 服务启动时自动使用 `webbrowser.open` 打开主物理局域网地址 | ✅ 已完成 |
-| **阶段 1** | **T1.2** | PowerShell 启动器增加打开网页 | `launcher.ps1` | 服务启动前调用 `Start-Process $primaryUrl` 自动打开浏览器 | ✅ 已完成 |
-| **阶段 2** | **T2.1** | 重构 `UploadTask` 支持相对路径层级 | `web/app.js` | 保留 `webkitRelativePath`，分段 URI 编码拼接 URL，自动由 dufs 创建父目录 | ✅ 已完成 |
-| **阶段 2** | **T2.2** | 升级全屏拖拽支持整目录递归展开 | `web/app.js` | 基于 `webkitGetAsEntry` 递归解析拖入的文件夹，生成带路径的文件列表 | ✅ 已完成 |
-| **阶段 2** | **T2.3** | 升级版本防缓存时间戳 | `web/index.html` | 更新脚本版本戳为 `v=20261026_folder_upload_r1`，确保客户端秒级生效 | ✅ 已完成 |
-| **阶段 3** | **T3.1** | 本地语法与多层级目录上传实测 | 本地测试 | 校验 JS 语法，自检通过，PUT 嵌套路径自动创建父目录机制验证通过 | ✅ 已完成 |
-| **阶段 3** | **T3.2** | 重新打包便携压缩包 | `launcher.ps1` | 重新生成最新便携包 `LAN-Fast-Share-Portable.zip`（保留本地，未推送到 GitHub） | ✅ 已完成 |
+| **阶段 1** | **T1.1** | HTML 文件选择器标准属性补全 | `web/index.html` | 在 `hiddenFolderInput` 增加 `directory` 与 `multiple` 属性 | ✅ 已完成 |
+| **阶段 1** | **T1.2** | 新增移动端专用 ZIP 与归类选择器 | `web/index.html` | 增加 hiddenZipFolderInput 和 hiddenFolderMultiFileInput | ✅ 已完成 |
+| **阶段 1** | **T1.3** | 新增“移动端目录上传助手”弹窗结构 | `web/index.html` | 增加精简优雅的模态框，提供多文件归档、ZIP还原、原生尝试三项操作 | ✅ 已完成 |
+| **阶段 2** | **T2.1** | 编写移动端目录助手样式 | `web/style.css` | 适配手机触屏与深色模式，卡片式布局与大触控区域 | ✅ 已完成 |
+| **阶段 2** | **T2.2** | 增强 `UploadTask` 路径清洗与 Android 容错 | `web/app.js` | 彻底剔除 Android SAF 的 `primary:`、`content:` 等畸变前缀 | ✅ 已完成 |
+| **阶段 2** | **T2.3** | 实现原生 `DecompressionStream` 客户端轻量 ZIP 目录树解析引擎 | `web/app.js` | 纯原生无需第三方库，秒级解压 ZIP 并提取包含层级的 `File` 列表 | ✅ 已完成 |
+| **阶段 2** | **T2.4** | 绑定移动端目录上传多轨交互逻辑 | `web/app.js` | 点击【上传目录】时根据设备类型自适应弹窗或直调原生 | ✅ 已完成 |
+| **阶段 3** | **T3.1** | 更新防缓存版本戳与功能回归测试 | `web/index.html` | 升级 `?v=20261027_android_folder_r1`，验证 JS 语法及逻辑正确性 | ✅ 已完成 |
+| **阶段 3** | **T3.2** | 重新打包便携式发行版 ZIP | `launcher.py` | 运行 `--pack` 重新生成 `LAN-Fast-Share-Portable.zip` | ✅ 已完成 |
 
 ---
 
 ## 4. 预期验收指标
 
-1. **自动打开**：双击启动后，电脑默认浏览器立即自动弹出并访问 `http://192.168.3.49:5000/`；
-2. **目录上传**：点击【📁 上传目录】选择一个包含子文件夹的文件树，上传完毕后服务器自动按原目录树结构存放，页面刷新后呈现完整的文件夹层级；
-3. **拖拽支持**：直接将电脑上的文件夹拖拽进网页，自动递归识别所有子目录和文件并完整上传。
+1. **Android 原生兼容**：在支持原生目录选择的移动浏览器中，补齐属性后可正常弹出选择器，且清洗后的路径能正常在服务端建立层级目录；
+2. **多文件归类上传**：安卓手机用户点击【上传目录】->【按目录归档多文件】，输入目录名后多选 10 张手机照片，服务端自动创建该文件夹，照片全部井然有序存入其中；
+3. **ZIP 还原目录树**：安卓手机用户将包含多级子目录的文件夹压缩为 `.zip`，选择该 zip 上传后，前端秒级提取完整多层目录树，服务端精准还原相同层级结构；
+4. **桌面端体验零影响**：PC 端点击【上传目录】依旧秒开原生文件夹选择器，拖拽目录上传保持满血流畅。

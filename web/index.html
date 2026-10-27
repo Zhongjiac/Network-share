@@ -47,6 +47,11 @@
                     <span>📱</span>
                     <span class="btn-text-sm">手机扫码</span>
                 </button>
+                <!-- 下载路径设置 (参考百度网盘) -->
+                <button class="icon-btn" id="downloadSettingsBtn" title="下载路径设置 (自定义/默认)">
+                    <span>⚙️</span>
+                    <span class="btn-text-sm">下载设置</span>
+                </button>
                 <!-- 传输中心入口 -->
                 <button class="header-transfer-btn" id="headerTransferBtn" title="打开传输任务中心">
                     <span>⚡ 传输中心</span>
@@ -342,6 +347,86 @@
             </div>
             <div class="modal-footer">
                 <button class="btn btn-secondary" id="mobileFolderCancelBtn">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 下载路径设置模态框 (参考百度网盘) -->
+    <div class="modal-overlay" id="downloadSettingsModal">
+        <div class="modal-dialog download-settings-dialog">
+            <div class="modal-header">
+                <h3>⚙️ 下载设置</h3>
+                <button class="modal-close" id="downloadSettingsClose">✕</button>
+            </div>
+            <div class="modal-body download-settings-body">
+                <div class="setting-section">
+                    <label class="setting-title">下载文件保存位置</label>
+                    
+                    <!-- 选项 1: 浏览器默认路径 -->
+                    <div class="setting-radio-card" id="settingOptDefault">
+                        <label class="radio-label">
+                            <input type="radio" name="downloadPathMode" id="radioDefaultPath" value="default" checked>
+                            <span class="radio-custom"></span>
+                            <div class="radio-content">
+                                <span class="radio-heading">使用浏览器默认下载路径（推荐）</span>
+                                <span class="radio-desc">直接存入系统「下载」文件夹，下载完成后可在浏览器右上角下载列表点击「在文件夹中显示」直达。</span>
+                            </div>
+                        </label>
+                    </div>
+
+                    <!-- 选项 2: 自定义本地目录 (基于 File System Access API) -->
+                    <div class="setting-radio-card" id="settingOptCustom">
+                        <label class="radio-label">
+                            <input type="radio" name="downloadPathMode" id="radioCustomPath" value="custom">
+                            <span class="radio-custom"></span>
+                            <div class="radio-content">
+                                <span class="radio-heading">指定本地下载目录（类似百度网盘）</span>
+                                <span class="radio-desc">通过系统目录选择器指定专属文件夹，所有下载任务直接流式写入该目录。</span>
+                            </div>
+                        </label>
+                        <div class="custom-path-box" id="customPathBox">
+                            <div class="path-display" id="currentCustomPathText">未选择任何目录</div>
+                            <button class="btn btn-secondary btn-sm" id="selectDirectoryBtn">📁 更改路径...</button>
+                        </div>
+                        <div class="fs-support-tip" id="fsSupportTip" style="display:none;"></div>
+                    </div>
+                </div>
+
+                <div class="setting-section">
+                    <label class="setting-title">下载交互偏好</label>
+                    <label class="setting-checkbox-row">
+                        <input type="checkbox" id="checkAskSaveLocation">
+                        <span class="checkbox-text">每次下载前弹出保存位置选择器（逐个确认）</span>
+                    </label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="downloadSettingsCancelBtn">关闭</button>
+                <button class="btn btn-primary" id="downloadSettingsSaveBtn">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 查看文件所在路径定位引导模态框 (参考 GitHub / 百度网盘) -->
+    <div class="modal-overlay" id="downloadLocationModal">
+        <div class="modal-dialog prompt-dialog">
+            <div class="modal-header">
+                <h3>📍 文件保存位置</h3>
+                <button class="modal-close" id="downloadLocationClose">✕</button>
+            </div>
+            <div class="modal-body download-location-body">
+                <div class="location-icon-box">📁</div>
+                <div class="location-file-name" id="locationFileName">文件名</div>
+                <div class="location-detail-box" id="locationDetailBox">
+                    <!-- 动态生成路径说明 -->
+                </div>
+                <div class="location-tip-box" id="locationTipBox">
+                    <!-- 快捷操作提示 -->
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="locationCloseBtn">知道了</button>
+                <button class="btn btn-primary" id="locationOpenFileBtn">📂 直接打开文件</button>
             </div>
         </div>
     </div>

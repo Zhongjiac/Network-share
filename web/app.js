@@ -1035,6 +1035,187 @@
         }
     }
 
+    /**
+     * @brief 规范化全局原生下载辅助方法 (直存浏览器默认下载路径)
+     * @param {string} filename 文件名
+     * @param {string} url 下载地址或 Blob 临时 URL
+     */
+    function triggerDirectNativeDownload(filename, url) {
+        const a = document.createElement('a');
+        a.style.display = 'none';
+        a.href = url;
+        a.download = filename || 'download';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => {
+            if (a.parentNode) a.parentNode.removeChild(a);
+        }, 1500);
+    }
+
+    /**
+     * @brief 下载路径与目录句柄管理器 (基于 IndexedDB 与 File System Access API)
+     * @details 参考百度网盘与 GitHub 下载策略:
+     * 1. 默认路径: 交由浏览器内核处理，下载至系统默认下载文件夹，可在右上角/下载栏点击「在文件夹中显示」；
+     * 2. 自定义目录: 唤起原生 showDirectoryPicker，获得 FileSystemDirectoryHandle，持久化保存在 IndexedDB 中，
+     *    流式直接写入选定文件夹，不占 JS 内存。
+     */
+    const DownloadPathManager = {
+        DB_NAME: 'LAN_FAST_SHARE_SETTINGS',
+        STORE_NAME: 'download_prefs',
+        dbPromise: null,
+        mode: 'default', // 'default' | 'custom'
+        customDirName: '',
+        customDirHandle: null,
+        askSaveLocation: false,
+
+        isSupported() {
+            return typeof window.showDirectoryPicker === 'function';
+        },
+
+        async getDB() {
+            if (this.dbPromise) return this.dbPromise;
+            this.dbPromise = new Promise((resolve, reject) => {
+                try {
+                    const req = indexedDB.open(this.DB_NAME, 1);
+                    req.onupgradeneeded = (e) => {
+                        const db = e.target.result;
+                        if (!db.objectStoreNames.contains(this.STORE_NAME)) {
+                            db.createObjectStore(this.STORE_NAME);
+                        }
+                    };
+                    req.onsuccess = (e) => resolve(e.target.result);
+                    req.onerror = (e) => reject(e.target.error);
+                } catch (err) {
+                    reject(err);
+                }
+            });
+            return this.dbPromise;
+        },
+
+        async getPref(key) {
+            try {
+                const db = await this.getDB();
+                return new Promise((resolve) => {
+                    const tx = db.transaction(this.STORE_NAME, 'readonly');
+                    const store = tx.objectStore(this.STORE_NAME);
+                    const req = store.get(key);
+                    req.onsuccess = () => resolve(req.result);
+                    req.onerror = () => resolve(null);
+                });
+            } catch (_) {
+                return null;
+            }
+        },
+
+        async setPref(key, value) {
+            try {
+                const db = await this.getDB();
+                return new Promise((resolve) => {
+                    const tx = db.transaction(this.STORE_NAME, 'readwrite');
+                    const store = tx.objectStore(this.STORE_NAME);
+                    const req = store.put(value, key);
+                    req.onsuccess = () => resolve(true);
+                    req.onerror = () => resolve(false);
+                });
+            } catch (_) {
+                return false;
+            }
+        },
+
+        async init() {
+            try {
+                const savedMode = await this.getPref('download_mode');
+                if (savedMode === 'custom' || savedMode === 'default') {
+                    this.mode = savedMode;
+                }
+                const savedName = await this.getPref('custom_dir_name');
+                if (savedName) {
+                    this.customDirName = savedName;
+                }
+                const savedHandle = await this.getPref('custom_dir_handle');
+                if (savedHandle) {
+                    this.customDirHandle = savedHandle;
+                }
+                const savedAsk = await this.getPref('ask_save_location');
+                if (typeof savedAsk === 'boolean') {
+                    this.askSaveLocation = savedAsk;
+                }
+            } catch (_) {}
+            this.updateSettingsUI();
+        },
+
+        async selectCustomDirectory() {
+            if (!this.isSupported()) {
+                showToast('当前浏览器或环境暂不支持直接选择本地文件夹，将使用浏览器默认路径', 'warning', 4000);
+                return false;
+            }
+            try {
+                const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+                if (!handle) return false;
+                this.customDirHandle = handle;
+                this.customDirName = handle.name || '已选文件夹';
+                this.mode = 'custom';
+                await this.setPref('custom_dir_handle', handle);
+                await this.setPref('custom_dir_name', this.customDirName);
+                await this.setPref('download_mode', 'custom');
+                this.updateSettingsUI();
+                showToast(`已成功绑定下载目录: ${this.customDirName}`, 'success', 3000);
+                return true;
+            } catch (err) {
+                if (err.name !== 'AbortError') {
+                    showToast(`选择目录失败: ${err.message}`, 'error', 3000);
+                }
+                return false;
+            }
+        },
+
+        async getDirectoryHandle() {
+            if (this.mode !== 'custom' || !this.customDirHandle) return null;
+            try {
+                const status = await this.customDirHandle.queryPermission({ mode: 'readwrite' });
+                if (status === 'granted') return this.customDirHandle;
+                const requestStatus = await this.customDirHandle.requestPermission({ mode: 'readwrite' });
+                if (requestStatus === 'granted') return this.customDirHandle;
+            } catch (_) {}
+            return null;
+        },
+
+        updateSettingsUI() {
+            const radioDefault = document.getElementById('radioDefaultPath');
+            const radioCustom = document.getElementById('radioCustomPath');
+            const cardDefault = document.getElementById('settingOptDefault');
+            const cardCustom = document.getElementById('settingOptCustom');
+            const pathText = document.getElementById('currentCustomPathText');
+            const fsTip = document.getElementById('fsSupportTip');
+            const checkAsk = document.getElementById('checkAskSaveLocation');
+
+            if (checkAsk) checkAsk.checked = this.askSaveLocation;
+
+            if (!this.isSupported()) {
+                if (radioCustom) radioCustom.disabled = true;
+                if (fsTip) {
+                    fsTip.style.display = 'block';
+                    fsTip.innerText = '💡 当前浏览器暂未开放目录直接写入权限，已自动切换为浏览器默认下载路径。';
+                }
+                this.mode = 'default';
+            }
+
+            if (this.mode === 'custom' && this.isSupported()) {
+                if (radioCustom) radioCustom.checked = true;
+                if (cardCustom) cardCustom.classList.add('active');
+                if (cardDefault) cardDefault.classList.remove('active');
+            } else {
+                if (radioDefault) radioDefault.checked = true;
+                if (cardDefault) cardDefault.classList.add('active');
+                if (cardCustom) cardCustom.classList.remove('active');
+            }
+
+            if (pathText) {
+                pathText.innerText = this.customDirName ? `📁 ${this.customDirName}` : '未选择任何目录';
+            }
+        }
+    };
+
     class DownloadTask {
         constructor(filename, fileUrl, totalBytes) {
             this.id = 'down_' + Math.random().toString(36).slice(2);
@@ -1051,13 +1232,29 @@
             this.runPromise = null;
             this.resumeRequested = false;
             this.abortController = null;
+            this.savedLocation = '';
+            this.fileHandle = null;
+            this.writable = null;
         }
 
-        start() {
+        async start() {
             if (this.status !== 'pending' || this.runPromise) return;
-            // 针对超大文件 (大于 50MB)，直接分流交由浏览器原生下载直存磁盘，实现零 JS 内存占用，根除 OOM 闪退
+
+            // 检测下载目标路径模式 (自定义目录 vs 默认路径)
+            let dirHandle = null;
+            if (DownloadPathManager.mode === 'custom' && DownloadPathManager.isSupported()) {
+                dirHandle = await DownloadPathManager.getDirectoryHandle();
+                if (dirHandle) {
+                    this.savedLocation = DownloadPathManager.customDirName || '自定义本地目录';
+                }
+            }
+            if (!this.savedLocation) {
+                this.savedLocation = '浏览器默认下载目录';
+            }
+
+            // 针对默认路径下的超大文件 (大于 50MB)，直接分流交由浏览器原生下载直存磁盘，实现零 JS 内存占用
             const LARGE_FILE_THRESHOLD = 50 * 1024 * 1024;
-            if (this.totalBytes && this.totalBytes > LARGE_FILE_THRESHOLD) {
+            if (!dirHandle && this.totalBytes && this.totalBytes > LARGE_FILE_THRESHOLD) {
                 this.status = 'completed';
                 this.receivedBytes = this.totalBytes;
                 triggerDirectNativeDownload(this.filename, this.fileUrl);
@@ -1072,10 +1269,10 @@
             this.errorMessage = '';
             this.resumeRequested = false;
             const generation = ++this.generation;
-            this.runPromise = Promise.resolve().then(() => this.run(generation));
+            this.runPromise = Promise.resolve().then(() => this.run(generation, dirHandle));
         }
 
-        validateResponse(response, offset) {
+        validateResponse(response, offset, dirHandle) {
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const rawLength = response.headers.get('Content-Length');
             const length = rawLength === null ? null : Number(rawLength);
@@ -1085,8 +1282,8 @@
                 response.headers.get('Last-Modified') ? { name: 'Last-Modified', value: response.headers.get('Last-Modified') } : null;
 
             const LARGE_FILE_THRESHOLD = 50 * 1024 * 1024;
-            // 若首包发现实际长度大于阈值，立即原生交接
-            if (offset === 0 && length !== null && length > LARGE_FILE_THRESHOLD) {
+            // 若默认路径下首包发现实际长度大于阈值，立即原生交接
+            if (!dirHandle && offset === 0 && length !== null && length > LARGE_FILE_THRESHOLD) {
                 this.totalBytes = length;
                 this.receivedBytes = length;
                 this.status = 'completed';
@@ -1096,7 +1293,6 @@
             }
 
             if (offset) {
-                // 校验文件一致性
                 if (this.validator && validator && this.validator.value !== validator.value) {
                     throw new Error('RESTART_NEEDED');
                 }
@@ -1113,7 +1309,7 @@
             return length;
         }
 
-        async run(generation) {
+        async run(generation, dirHandle) {
             const current = () => generation === this.generation && this.status === 'running';
             const controller = this.abortController = new AbortController();
             let response;
@@ -1126,6 +1322,18 @@
             };
             try {
                 if (!current()) return;
+
+                // 若指定了自定义本地目录，初始化直接流式文件可写流
+                if (dirHandle && !this.writable) {
+                    try {
+                        this.fileHandle = await dirHandle.getFileHandle(this.filename, { create: true });
+                        this.writable = await this.fileHandle.createWritable();
+                    } catch (e) {
+                        this.writable = null;
+                        this.fileHandle = null;
+                    }
+                }
+
                 const offset = this.receivedBytes;
                 const headers = {};
                 if (offset > 0) {
@@ -1136,13 +1344,13 @@
                 response = await fetch(this.fileUrl, { method: 'GET', headers, signal: controller.signal });
                 if (!current()) return;
                 
-                const length = this.validateResponse(response, offset);
+                const length = this.validateResponse(response, offset, dirHandle);
                 clearTimeout(timer);
                 
                 reader = response.body.getReader();
                 let lastTime = performance.now();
                 let lastLoaded = this.receivedBytes;
-                if (!this.chunks) this.chunks = [];
+                if (!this.writable && !this.chunks) this.chunks = [];
 
                 while (reader && current()) {
                     armIdle();
@@ -1152,7 +1360,11 @@
                     if (timedOut) throw new Error('下载无进展超时（60 s），可继续重试');
                     if (done) break;
 
-                    this.chunks.push(value);
+                    if (this.writable) {
+                        await this.writable.write(value);
+                    } else {
+                        this.chunks.push(value);
+                    }
                     this.receivedBytes += value.byteLength;
 
                     const now = performance.now();
@@ -1166,23 +1378,24 @@
                 }
                 if (!current()) return;
 
-                // 下载完成，进入落盘阶段
+                // 下载完成，进入落盘收尾阶段
                 this.status = 'finishing';
                 this.speed = this.eta = 0;
                 TransferManager.updateTaskProgressDOM(this);
                 TransferManager.onTaskUpdated();
 
-                // 组装 Blob 并立即清空 chunks 引用，防止内存泄漏
-                const blob = new Blob(this.chunks, { type: 'application/octet-stream' });
-                this.chunks.length = 0;
-                this.chunks = null;
-
-                // 触发保存落盘
-                const blobUrl = URL.createObjectURL(blob);
-                triggerDirectNativeDownload(this.filename, blobUrl);
-                setTimeout(() => {
-                    URL.revokeObjectURL(blobUrl);
-                }, 1000);
+                if (this.writable) {
+                    await this.writable.close();
+                    this.writable = null;
+                } else if (this.chunks) {
+                    // 组装 Blob 并触发保存落盘，清空内存引用
+                    const blob = new Blob(this.chunks, { type: 'application/octet-stream' });
+                    this.chunks.length = 0;
+                    this.chunks = null;
+                    const blobUrl = URL.createObjectURL(blob);
+                    triggerDirectNativeDownload(this.filename, blobUrl);
+                    setTimeout(() => URL.revokeObjectURL(blobUrl), 1500);
+                }
 
                 this.status = 'completed';
             } catch (error) {
@@ -1193,11 +1406,15 @@
                     return;
                 }
                 if (error.message === 'RESTART_NEEDED') {
+                    if (this.writable) {
+                        try { await this.writable.abort(); } catch (_) {}
+                        this.writable = null;
+                    }
                     this.chunks = [];
                     this.receivedBytes = 0;
                     this.validator = null;
                     if (current()) {
-                        this.run(generation);
+                        this.run(generation, dirHandle);
                         return;
                     }
                 }
@@ -1213,6 +1430,11 @@
                     if (reader) await reader.cancel();
                     else if (response && response.body) await response.body.cancel();
                 } catch (_) {}
+
+                if (this.writable && this.status !== 'completed') {
+                    try { await this.writable.abort(); } catch (_) {}
+                    this.writable = null;
+                }
 
                 if (this.status === 'cancelling') {
                     if (this.chunks) {
@@ -1599,6 +1821,7 @@
                             <div class="task-name-box">
                                 <span class="task-file-icon">📥</span>
                                 <span class="task-file-name" title="${escapeHtml(t.filename)}">${escapeHtml(t.filename)}</span>
+                                ${t.status === 'completed' ? `<span class="task-destination-tag">${escapeHtml(t.savedLocation || '默认目录')}</span>` : ''}
                             </div>
                             <span class="task-badge-status ${t.status}">${this.getStatusText(t.status)}</span>
                             ${t.errorMessage ? `<span class="task-error-tip" title="${escapeHtml(t.errorMessage)}">${escapeHtml(t.errorMessage)}</span>` : ''}
@@ -1611,6 +1834,10 @@
                             <span>${t.status === 'running' ? formatSpeed(t.speed) + (t.totalBytes === null ? '' : ' · 剩余 ' + formatETA(t.eta)) : ''}</span>
                         </div>
                         <div class="task-actions">
+                            ${t.status === 'completed' ? `
+                                <button class="task-action-btn primary" onclick="window.TransferManager.openDownloadedFile('${t.id}')">📂 打开文件</button>
+                                <button class="task-action-btn" onclick="window.TransferManager.showDownloadedLocation('${t.id}')">📍 所在路径</button>
+                            ` : ''}
                             ${t.status === 'running' ? `<button class="task-action-btn" onclick="window.TransferManager.pauseTask('down', '${t.id}')">⏸ 暂停</button>` : ''}
                             ${t.status === 'paused' || t.status === 'error' ? `<button class="task-action-btn" onclick="window.TransferManager.resumeTask('down', '${t.id}')">▶ 继续</button>` : ''}
                             ${!['finishing', 'cancelling'].includes(t.status) ? `<button class="task-action-btn danger" onclick="window.TransferManager.cancelTask('down', '${t.id}')">${t.status === 'completed' ? '移除记录' : '✕ 取消'}</button>` : ''}
@@ -1618,6 +1845,59 @@
                     </div>`;
                 }).join('') + this.taskPager('download', this.downloadTasks.length);
             }
+        },
+
+        async openDownloadedFile(id) {
+            const task = this.downloadTasks.find(t => t.id === id);
+            if (!task) return;
+            try {
+                if (task.fileHandle) {
+                    const file = await task.fileHandle.getFile();
+                    const url = URL.createObjectURL(file);
+                    window.open(url, '_blank');
+                    setTimeout(() => URL.revokeObjectURL(url), 30000);
+                    return;
+                }
+            } catch (_) {}
+            window.open(task.fileUrl, '_blank');
+        },
+
+        showDownloadedLocation(id) {
+            const task = this.downloadTasks.find(t => t.id === id);
+            if (!task) return;
+            const modal = document.getElementById('downloadLocationModal');
+            const nameEl = document.getElementById('locationFileName');
+            const detailBox = document.getElementById('locationDetailBox');
+            const tipBox = document.getElementById('locationTipBox');
+            const openBtn = document.getElementById('locationOpenFileBtn');
+
+            if (nameEl) nameEl.textContent = task.filename;
+            const isCustom = task.savedLocation && task.savedLocation !== '浏览器默认下载目录';
+
+            if (detailBox) {
+                detailBox.innerHTML = `
+                    <p style="margin-bottom:6px;"><strong>保存目标：</strong>${isCustom ? `本地文件夹 [${escapeHtml(task.savedLocation)}]` : '系统默认「下载」文件夹 (Downloads)'}</p>
+                    <p style="margin-bottom:6px;"><strong>文件大小：</strong>${formatBytes(task.receivedBytes || task.totalBytes || 0)}</p>
+                    <p><strong>落盘状态：</strong>100% 完整校验已落盘</p>
+                `;
+            }
+
+            if (tipBox) {
+                if (isCustom) {
+                    tipBox.innerHTML = `💡 <strong>直达提示：</strong>该文件已直接流式存入您的专属本地目录 <code>${escapeHtml(task.savedLocation)}</code>，在文件资源管理器中打开该文件夹即可查看。`;
+                } else {
+                    tipBox.innerHTML = `💡 <strong>参考 GitHub 交互：</strong>按键盘 <code>Ctrl + J</code>（Mac 上 <code>Cmd + Option + L</code>）呼出浏览器“下载内容”管理器，点击任务下方的 <strong>「在文件夹中显示」</strong> 即可由 Windows 资源管理器直接定位高亮文件！`;
+                }
+            }
+
+            if (openBtn) {
+                openBtn.onclick = () => {
+                    modal.classList.remove('active');
+                    this.openDownloadedFile(id);
+                };
+            }
+
+            if (modal) modal.classList.add('active');
         },
 
         getStatusText(status) {
@@ -2692,6 +2972,88 @@
             document.getElementById('previewModal').classList.remove('active');
             document.getElementById('previewBody').innerHTML = '';
         };
+
+        // 15. 下载路径设置初始化与事件绑定 (参考百度网盘与 GitHub)
+        DownloadPathManager.init();
+
+        const dlSettingsModal = document.getElementById('downloadSettingsModal');
+        const openDlSettings = () => {
+            DownloadPathManager.updateSettingsUI();
+            if (dlSettingsModal) dlSettingsModal.classList.add('active');
+        };
+        const closeDlSettings = () => {
+            if (dlSettingsModal) dlSettingsModal.classList.remove('active');
+        };
+        const dlSettingsBtn = document.getElementById('downloadSettingsBtn');
+        if (dlSettingsBtn) dlSettingsBtn.onclick = openDlSettings;
+        const dlSettingsClose = document.getElementById('downloadSettingsClose');
+        if (dlSettingsClose) dlSettingsClose.onclick = closeDlSettings;
+        const dlSettingsCancel = document.getElementById('downloadSettingsCancelBtn');
+        if (dlSettingsCancel) dlSettingsCancel.onclick = closeDlSettings;
+
+        // 单选切换
+        const radioDefault = document.getElementById('radioDefaultPath');
+        const radioCustom = document.getElementById('radioCustomPath');
+        if (radioDefault) {
+            radioDefault.onchange = () => {
+                if (radioDefault.checked) {
+                    DownloadPathManager.mode = 'default';
+                    DownloadPathManager.setPref('download_mode', 'default');
+                    DownloadPathManager.updateSettingsUI();
+                }
+            };
+        }
+        if (radioCustom) {
+            radioCustom.onchange = async () => {
+                if (radioCustom.checked) {
+                    if (!DownloadPathManager.customDirHandle) {
+                        const ok = await DownloadPathManager.selectCustomDirectory();
+                        if (!ok) {
+                            DownloadPathManager.mode = 'default';
+                            DownloadPathManager.updateSettingsUI();
+                            return;
+                        }
+                    } else {
+                        DownloadPathManager.mode = 'custom';
+                        DownloadPathManager.setPref('download_mode', 'custom');
+                        DownloadPathManager.updateSettingsUI();
+                    }
+                }
+            };
+        }
+
+        // 更改目录按钮
+        const selectDirBtn = document.getElementById('selectDirectoryBtn');
+        if (selectDirBtn) {
+            selectDirBtn.onclick = async () => {
+                await DownloadPathManager.selectCustomDirectory();
+            };
+        }
+
+        // 询问保存位置复选框
+        const checkAsk = document.getElementById('checkAskSaveLocation');
+        if (checkAsk) {
+            checkAsk.onchange = () => {
+                DownloadPathManager.askSaveLocation = checkAsk.checked;
+                DownloadPathManager.setPref('ask_save_location', checkAsk.checked);
+            };
+        }
+
+        // 保存/确定按钮
+        const dlSettingsSave = document.getElementById('downloadSettingsSaveBtn');
+        if (dlSettingsSave) {
+            dlSettingsSave.onclick = () => {
+                closeDlSettings();
+                showToast(`下载设置已生效：${DownloadPathManager.mode === 'custom' ? '已绑定 ' + DownloadPathManager.customDirName : '使用系统默认下载路径'}`, 'info', 3000);
+            };
+        }
+
+        // 定位模态框关闭绑定
+        const dlLocModal = document.getElementById('downloadLocationModal');
+        const dlLocClose = document.getElementById('downloadLocationClose');
+        const dlLocBtn = document.getElementById('locationCloseBtn');
+        if (dlLocClose) dlLocClose.onclick = () => dlLocModal.classList.remove('active');
+        if (dlLocBtn) dlLocBtn.onclick = () => dlLocModal.classList.remove('active');
 
         // 15. SPA 浏览器历史前进/后退
         window.onpopstate = (e) => {

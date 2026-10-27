@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>LAN Fast Share - 局域网极速快传</title>
-    <link rel="stylesheet" href="__ASSETS_PREFIX__style.css?v=20261027_android_folder_r1">
+    <link rel="stylesheet" href="__ASSETS_PREFIX__style.css?v=20261027_wechat_media_r1">
     <script>
         const __RAW_INDEX__ = "__INDEX_DATA__";
         const __RAW_PATH__ = "__PATH_PREFIX__";
@@ -346,6 +346,39 @@
         </div>
     </div>
 
+    <!-- 移动端仿微信/QQ快捷媒体上传底部抽屉 (Action Sheet) -->
+    <div class="action-sheet-overlay" id="mobileMediaActionSheet">
+        <div class="action-sheet-panel">
+            <div class="action-sheet-header">
+                <span class="action-sheet-title">快捷上传至当前目录</span>
+                <button class="action-sheet-close" id="mobileMediaClose">✕</button>
+            </div>
+            <div class="media-grid">
+                <div class="media-grid-item" id="mediaOptPhotos">
+                    <div class="media-icon-box bg-photo">🖼️</div>
+                    <span class="media-title">手机相册</span>
+                    <span class="media-subtitle">图片多选秒传</span>
+                </div>
+                <div class="media-grid-item" id="mediaOptVideos">
+                    <div class="media-icon-box bg-video">🎬</div>
+                    <span class="media-title">手机视频</span>
+                    <span class="media-subtitle">快速挑选录像</span>
+                </div>
+                <div class="media-grid-item" id="mediaOptCamera">
+                    <div class="media-icon-box bg-camera">📸</div>
+                    <span class="media-title">现场拍摄</span>
+                    <span class="media-subtitle">拍照即刻发送</span>
+                </div>
+                <div class="media-grid-item" id="mediaOptFiles">
+                    <div class="media-icon-box bg-file">📄</div>
+                    <span class="media-title">手机存储</span>
+                    <span class="media-subtitle">全部文件与文档</span>
+                </div>
+            </div>
+            <div class="action-sheet-cancel" id="mobileMediaCancelBtn">取消</div>
+        </div>
+    </div>
+
     <!-- Toast 消息通知容器 -->
     <div class="toast-container" id="toastContainer"></div>
 
@@ -355,8 +388,13 @@
     <input type="file" id="hiddenZipFolderInput" accept=".zip,application/zip,application/x-zip-compressed" style="display:none;">
     <input type="file" id="hiddenFolderMultiFileInput" multiple style="display:none;">
 
+    <!-- 快捷媒体分类选择器 -->
+    <input type="file" id="hiddenImageInput" accept="image/*" multiple style="display:none;">
+    <input type="file" id="hiddenVideoInput" accept="video/*" multiple style="display:none;">
+    <input type="file" id="hiddenCameraInput" accept="image/*" capture="environment" style="display:none;">
+
     <!-- 核心驱动脚本 (带版本防缓存戳，保证浏览器秒级加载最新引擎) -->
-    <script src="__ASSETS_PREFIX__qrcode.min.js?v=20261027_android_folder_r1"></script>
-    <script src="__ASSETS_PREFIX__app.js?v=20261027_android_folder_r1"></script>
+    <script src="__ASSETS_PREFIX__qrcode.min.js?v=20261027_wechat_media_r1"></script>
+    <script src="__ASSETS_PREFIX__app.js?v=20261027_wechat_media_r1"></script>
 </body>
 </html>

@@ -2228,8 +2228,51 @@
         const folderInput = document.getElementById('hiddenFolderInput');
         const zipFolderInput = document.getElementById('hiddenZipFolderInput');
         const multiFileInput = document.getElementById('hiddenFolderMultiFileInput');
+        const imageInput = document.getElementById('hiddenImageInput');
+        const videoInput = document.getElementById('hiddenVideoInput');
+        const cameraInput = document.getElementById('hiddenCameraInput');
 
-        document.getElementById('uploadFileBtn').onclick = () => fileInput.click();
+        // 移动端仿微信/QQ快捷媒体上传抽屉控制器
+        function openMobileMediaActionSheet() {
+            const sheet = document.getElementById('mobileMediaActionSheet');
+            sheet.classList.add('active');
+            const close = () => sheet.classList.remove('active');
+            document.getElementById('mobileMediaClose').onclick = close;
+            document.getElementById('mobileMediaCancelBtn').onclick = close;
+
+            // 1. 手机相册 (直达图片多选)
+            document.getElementById('mediaOptPhotos').onclick = () => {
+                close();
+                imageInput.click();
+            };
+
+            // 2. 手机视频 (直达视频库多选)
+            document.getElementById('mediaOptVideos').onclick = () => {
+                close();
+                videoInput.click();
+            };
+
+            // 3. 现场拍摄 (直达后置相机)
+            document.getElementById('mediaOptCamera').onclick = () => {
+                close();
+                cameraInput.click();
+            };
+
+            // 4. 手机存储 (通用全类型文件管理器)
+            document.getElementById('mediaOptFiles').onclick = () => {
+                close();
+                fileInput.click();
+            };
+        }
+
+        // 双端自适应绑定: 移动端弹仿微信底栏，PC端直接打开文件选择
+        document.getElementById('uploadFileBtn').onclick = () => {
+            if (isMobileDevice()) {
+                openMobileMediaActionSheet();
+            } else {
+                fileInput.click();
+            }
+        };
 
         // 移动端/桌面端自适应目录上传路由
         let targetCategoryFolderName = '';
@@ -2272,12 +2315,18 @@
             }
         };
 
-        fileInput.onchange = () => {
-            if (fileInput.files.length > 0) {
-                TransferManager.addUploadFiles(fileInput.files, state.currentPath);
-                fileInput.value = '';
+        const handleBatchUpload = (inputEl) => {
+            if (inputEl.files.length > 0) {
+                TransferManager.addUploadFiles(inputEl.files, state.currentPath);
+                inputEl.value = '';
             }
         };
+
+        fileInput.onchange = () => handleBatchUpload(fileInput);
+        imageInput.onchange = () => handleBatchUpload(imageInput);
+        videoInput.onchange = () => handleBatchUpload(videoInput);
+        cameraInput.onchange = () => handleBatchUpload(cameraInput);
+
         folderInput.onchange = () => {
             if (folderInput.files.length > 0) {
                 TransferManager.addUploadFiles(folderInput.files, state.currentPath);

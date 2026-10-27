@@ -2978,14 +2978,23 @@
 
         const dlSettingsModal = document.getElementById('downloadSettingsModal');
         const openDlSettings = () => {
+            console.log('[LAN Fast Share] 触发下载设置面板唤起');
             DownloadPathManager.updateSettingsUI();
-            if (dlSettingsModal) dlSettingsModal.classList.add('active');
+            if (dlSettingsModal) {
+                dlSettingsModal.classList.add('active');
+            } else {
+                console.error('[LAN Fast Share] 未找到 downloadSettingsModal DOM 节点');
+            }
         };
+        window.openDownloadSettingsModal = openDlSettings;
+
         const closeDlSettings = () => {
             if (dlSettingsModal) dlSettingsModal.classList.remove('active');
         };
         const dlSettingsBtn = document.getElementById('downloadSettingsBtn');
         if (dlSettingsBtn) dlSettingsBtn.onclick = openDlSettings;
+        const drawerSettingsBtn = document.getElementById('drawerSettingsBtn');
+        if (drawerSettingsBtn) drawerSettingsBtn.onclick = openDlSettings;
         const dlSettingsClose = document.getElementById('downloadSettingsClose');
         if (dlSettingsClose) dlSettingsClose.onclick = closeDlSettings;
         const dlSettingsCancel = document.getElementById('downloadSettingsCancelBtn');

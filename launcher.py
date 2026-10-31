@@ -192,26 +192,30 @@ def get_lan_ips():
     return candidates
 
 def get_qr_matrix(text: str):
-    """获取二维码布尔矩阵 (True=黑, False=白，严格符合 ISO/IEC 18004 标准静区)"""
+    """
+    @brief 获取二维码布尔矩阵 (True=黑, False=白，严格符合 ISO/IEC 18004 标准静区)
+    @param[in] text 二维码编码的文本/URL
+    @return 二维码布尔二维矩阵列表；若未安装 qrcode 库则安全返回 None，绝不阻塞联网执行 pip 下载
+    @note 保证白板电脑与离线环境下零延迟启动与开箱即用
+    """
     try:
         import qrcode
     except ImportError:
-        try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "qrcode"],
-                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            import qrcode
-        except Exception:
-            return None
+        # 绝不调用 pip install，零延迟安全降级，避免非开发机卡死
+        return None
 
-    qr = qrcode.QRCode(
-        version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=1,
-        border=4  # ISO/IEC 18004 国际标准要求白边至少为 4 个模块
-    )
-    qr.add_data(text)
-    qr.make(fit=True)
-    return qr.get_matrix()
+    try:
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=1,
+            border=4  # ISO/IEC 18004 国际标准要求白边至少为 4 个模块
+        )
+        qr.add_data(text)
+        qr.make(fit=True)
+        return qr.get_matrix()
+    except Exception:
+        return None
 
 def render_terminal_qr(matrix) -> str:
     """使用 Unicode 半块字符渲染紧凑高对比度白底黑块二维码 (防形变与错位)"""
@@ -650,12 +654,12 @@ def main():
 
     # 6. 显示终端半块字符二维码与信息面板
     print("\n" + "-" * 65)
-    print("[手机扫码直达] (手机与电脑连接同一 Wi-Fi 或路由器即可扫码):")
     qr_str = render_terminal_qr(matrix)
     if qr_str:
+        print("[手机扫码直达] (手机与电脑连接同一 Wi-Fi 或路由器即可扫码):")
         print(qr_str)
     else:
-        print("  [二维码渲染库加载中... 可直接访问下方网址]")
+        print("[手机扫码直达] (已为您自动在默认浏览器中打开高清离线扫码页，或直接访问下方网址)")
 
     print(f"\n[访问网址]: \033[1;32m{primary_url}\033[0m")
     if len(lan_ips) > 1:

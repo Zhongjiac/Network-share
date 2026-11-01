@@ -496,8 +496,20 @@ body {
 }
 .file-table th.sortable {
     cursor: pointer;
+    transition: color var(--transition-fast), background-color var(--transition-fast);
 }
 .file-table th.sortable:hover {
+    color: var(--primary);
+    background: var(--bg-card);
+}
+.file-table th.sortable.active-sort {
+    color: var(--primary);
+}
+.file-table th.sortable .sort-indicator {
+    display: inline-block;
+    margin-left: 5px;
+    font-size: 13px;
+    font-weight: 700;
     color: var(--primary);
 }
 

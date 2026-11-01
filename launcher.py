@@ -543,6 +543,8 @@ def pack_portable():
         "打包便携发行版.bat",
         "launcher.py",
         "launcher.ps1",
+        "native-helper.ps1",
+        "native-helper.cs",
         "README.md",
         "qrcode_guide.html"
     ]
@@ -633,6 +635,8 @@ def main():
     if port != DEFAULT_PORT:
         print(f"[*] 默认端口 {DEFAULT_PORT} 已被占用，已自动顺延至可用端口: {port}")
 
+    helper_port = find_available_port(port + 50)
+    local_url = f"http://127.0.0.1:{helper_port}"
     primary_url = f"http://{primary_ip}:{port}"
     all_urls = [f"http://{item['ip']}:{port}" for item in lan_ips]
 
@@ -642,6 +646,7 @@ def main():
             "primary_ip": primary_ip,
             "port": port,
             "primary_url": primary_url,
+            "local_url": local_url,
             "all_urls": all_urls
         }
         (WEB_DIR / "server-info.json").write_text(json.dumps(server_info, indent=2), encoding="utf-8")
@@ -694,7 +699,7 @@ def main():
     cmd = [
         str(DUFS_EXE),
         str(shared_dir),
-        "-A",
+        "-A", "--allow-hash",
         "-b", "0.0.0.0",
         "-p", str(port),
         "--assets", str(WEB_DIR)
@@ -702,25 +707,54 @@ def main():
 
     # 统一进程管理
     proc = subprocess.Popen(cmd)
+    helper = None
+    try:
+        helper = subprocess.Popen([
+            'powershell', '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass',
+            '-File', str(SCRIPT_DIR / 'native-helper.ps1'),
+            '-SharedDir', str(shared_dir), '-DufsPort', str(port),
+            '-Port', str(helper_port), '-OwnerProcessId', str(os.getpid())
+        ], creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        print(f"[本机复制入口]: {local_url}（手机请使用局域网地址）")
+    except OSError as error:
+        print(f"[提示] 本机复制入口启动失败：{error}，仍可使用网络上传")
+
+    def stop_helper():
+        if helper is not None and helper.poll() is None:
+            try:
+                import urllib.request
+                request = urllib.request.Request(local_url + '/__local/shutdown', data=b'', method='POST',
+                                                 headers={'Origin': local_url})
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(request, timeout=10) as response:
+                    response.read()
+                helper.wait(timeout=3)
+            except Exception:
+                # 父进程退出后，辅助程序自行取消任务、清理临时文件并退出。
+                pass
 
     # 自动在默认浏览器中打开局域网物理 IP 的 Web 页面
     try:
         import threading
         def open_browser():
-            # 动态轮询探测服务端口连通性 (最多尝试 30 次，每次 100ms)
-            for _ in range(30):
+            # 动态轮询探测服务端口连通性 (最多尝试 100 次，每次 100ms)
+            browser_url = primary_url
+            target_port = helper_port if helper is not None else port
+            for _ in range(100):
                 try:
-                    with socket.create_connection(("127.0.0.1", port), timeout=0.15):
+                    with socket.create_connection(("127.0.0.1", target_port), timeout=0.15):
+                        browser_url = local_url if target_port == helper_port else primary_url
                         break
                 except Exception:
                     time.sleep(0.1)
-            webbrowser.open(primary_url)
+            webbrowser.open(browser_url)
         threading.Thread(target=open_browser, daemon=True).start()
     except Exception:
         pass
 
     def clean_exit(signum=None, frame=None):
         print("\n\n正在停止局域网快传核心引擎...")
+        stop_helper()
         try:
             proc.terminate()
             proc.wait(timeout=2)
@@ -739,6 +773,8 @@ def main():
         proc.wait()
     except KeyboardInterrupt:
         clean_exit()
+    finally:
+        stop_helper()
 
 if __name__ == "__main__":
     main()

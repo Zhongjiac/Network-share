@@ -719,12 +719,9 @@
      */
     function sanitizeRelativePath(file) {
         let raw = file.webkitRelativePath || file.relativePath || file.name || 'unnamed';
-        // 1. 若包含 URL 编码字符（如 primary%3A），安全解码
-        if (raw.includes('%')) {
-            try { raw = decodeURIComponent(raw); } catch (e) {}
-        }
-        // 2. 剥离 Android SAF 与 Linux 挂载路径特有前缀 (如 primary:, content:, /storage/emulated/0/ 等)
-        raw = raw.replace(/^.*(?::|%3A|\/storage\/emulated\/\d+\/)/i, '');
+        // File API 提供的是原始名称，百分号属于文件名，不做 URI 解码。
+        // 2. 只处理明确的 primary: 与 /storage/emulated/0/ 前缀
+        raw = raw.replace(/^(?:primary:|\/storage\/emulated\/\d+\/)/i, '');
         // 3. 统一斜杠并清理首尾斜杠
         raw = raw.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/^\/+|\/+$/g, '');
         // 4. 清理每个路径段中的 Windows 非法字符 (如冒号、星号、问号等)
@@ -875,23 +872,182 @@
     const TRANSFER_LIMITS = Object.freeze({ chunkBytes: 8 * 1024 * 1024,
         idleMs: 60000, headMs: 10000 });
 
+    const FileHasher = {
+        tail: Promise.resolve(),
+        hash(file, onProgress, signal) {
+            const job = this.tail.then(() => new Promise((resolve, reject) => {
+                if (signal && signal.aborted) { reject(new DOMException('已取消', 'AbortError')); return; }
+                const script = document.querySelector('script[src*="app.js"]');
+                const workerUrl = new URL('sha256-worker.js', script ? script.src : window.location.href);
+                const worker = new Worker(workerUrl);
+                const finish = (error, hash) => {
+                    worker.terminate();
+                    if (signal) signal.removeEventListener('abort', abort);
+                    if (error) reject(error); else resolve(hash);
+                };
+                const abort = () => finish(new DOMException('已取消', 'AbortError'));
+                if (signal) signal.addEventListener('abort', abort, { once: true });
+                worker.onmessage = event => {
+                    if (event.data.error) finish(new Error(event.data.error));
+                    else if (event.data.hash) finish(null, event.data.hash);
+                    else if (typeof onProgress === 'function') onProgress(event.data.loaded);
+                };
+                worker.onerror = event => finish(new Error(event.message || '文件读取线程失败'));
+                worker.postMessage(file);
+            }));
+            this.tail = job.catch(() => {});
+            return job;
+        }
+    };
+
+    const LocalCopy = {
+        enabled: false,
+        initialized: false,
+        removed: new Set(),
+        async init() {
+            try {
+                const response = await fetch('/__local/info');
+                if (!response.ok || !(await response.json()).local) return;
+                this.enabled = true;
+                this.poll();
+            } catch (_) {}
+            finally {
+                this.initialized = true;
+            }
+        },
+        async paste(targetDir) {
+            try {
+                const response = await fetch('/__local/paste', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ directory: targetDir || state.currentPath || '/' })
+                });
+                if (!response.ok) return { ok: false };
+                const data = await response.json();
+                if (data && data.ok) {
+                    TransferManager.openDrawer('upload');
+                    this.poll();
+                }
+                return data;
+            } catch (error) {
+                return { ok: false, error: error.message };
+            }
+        },
+        async selectFiles(targetDir) {
+            try {
+                const response = await fetch('/__local/select_files', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ directory: targetDir || state.currentPath || '/' })
+                });
+                if (!response.ok) return { ok: false };
+                const data = await response.json();
+                if (data && data.ok) {
+                    TransferManager.openDrawer('upload');
+                    this.poll();
+                }
+                return data;
+            } catch (error) {
+                return { ok: false, error: error.message };
+            }
+        },
+        async selectFolder(targetDir) {
+            try {
+                const response = await fetch('/__local/select_folder', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ directory: targetDir || state.currentPath || '/' })
+                });
+                if (!response.ok) return { ok: false };
+                const data = await response.json();
+                if (data && data.ok) {
+                    TransferManager.openDrawer('upload');
+                    this.poll();
+                }
+                return data;
+            } catch (error) {
+                return { ok: false, error: error.message };
+            }
+        },
+        async poll() {
+            try {
+                const response = await fetch('/__local/tasks');
+                if (!response.ok) return;
+                const data = await response.json();
+                let changed = false;
+                for (const snapshot of data.tasks) {
+                    if (this.removed.has(snapshot.id)) continue;
+                    let task = TransferManager.uploadTasks.find(item => item.id === snapshot.id);
+                    if (!task) {
+                        task = {
+                            id: snapshot.id,
+                            filename: snapshot.filename,
+                            totalBytes: snapshot.totalBytes,
+                            uploadedBytes: snapshot.uploadedBytes,
+                            status: snapshot.status,
+                            native: true,
+                            speed: 0,
+                            eta: 0,
+                            targetKey: snapshot.id,
+                            pause() {},
+                            resume() {},
+                            cancel: async () => {
+                                if (!['completed', 'cancelled', 'error'].includes(task.status)) {
+                                    try {
+                                        await fetch('/__local/cancel', {
+                                            method: 'POST',
+                                            headers: { 'Content-Type': 'application/json' },
+                                            body: JSON.stringify({ id: task.id })
+                                        });
+                                    } catch (_) {}
+                                }
+                                this.removed.add(task.id);
+                                TransferManager.removeUploadTask(task.id);
+                            }
+                        };
+                        TransferManager.uploadTasks.push(task);
+                        TransferManager.openDrawer('upload');
+                        changed = true;
+                    }
+                    const signature = JSON.stringify(snapshot);
+                    if (task.snapshotSignature !== signature) {
+                        task.snapshotSignature = signature;
+                        changed = true;
+                        const completed = task.status !== 'completed' && snapshot.status === 'completed';
+                        const now = performance.now();
+                        const elapsed = task.sampleAt ? (now - task.sampleAt) / 1000 : 0;
+                        task.speed = snapshot.status === 'running' && elapsed > 0 ? Math.max(0, snapshot.uploadedBytes - (task.sampleBytes || 0)) / elapsed : 0;
+                        task.eta = task.speed ? Math.max(0, snapshot.totalBytes - snapshot.uploadedBytes) / task.speed : 0;
+                        task.sampleAt = now;
+                        task.sampleBytes = snapshot.uploadedBytes;
+                        Object.assign(task, snapshot);
+                        if (completed) TransferManager.triggerDirectoryRefresh();
+                    }
+                    TransferManager.updateTaskProgressDOM(task);
+                }
+                if (changed) TransferManager.onTaskUpdated();
+            } catch (_) {}
+            if (this.enabled) {
+                const hasActive = TransferManager.uploadTasks.some(t => t.native && ['pending', 'running'].includes(t.status));
+                setTimeout(() => this.poll(), hasActive ? 300 : 800);
+            }
+        }
+    };
+
     class UploadTask {
         constructor(file, targetDir) {
             this.id = 'up_' + Math.random().toString(36).slice(2);
             this.file = file;
             this.targetDir = targetDir;
-            // 提取并清洗相对路径（防御性剔除 Android SAF 畸变前缀、非法冒号与首尾斜杠），完美保留文件夹层级
             const rawRelative = sanitizeRelativePath(file);
+            this.rawRelative = rawRelative;
             this.relativePath = rawRelative;
-            this.filename = rawRelative;
-            this.targetKey = (targetDir + '/' + rawRelative).toLowerCase();
-            
-            // 对层级路径中的每一级目录分别进行 URI 编码，再以 / 连接
-            const encodedSegments = rawRelative.split('/').map(seg => encodeURIComponent(seg)).join('/');
-            this.targetUrl = (targetDir === '/' ? '' : targetDir) + '/' + encodedSegments;
+            this.setTargetName(rawRelative);
+
             this.totalBytes = file.size;
             this.uploadedBytes = 0;
             this.serverOffset = 0;
+            this.readBytes = 0;
             this.status = 'pending';
             this.speed = this.eta = 0;
             this.errorMessage = '';
@@ -899,6 +1055,34 @@
             this.attempted = false;
             this.xhr = null;
             this.timer = null;
+            this.hashAbortController = null;
+            this.renameCount = 0;
+            this.retryCount = 0;
+            this.maxRetries = 5;
+            this.retryTimer = null;
+        }
+
+        setTargetName(relativePath) {
+            this.filename = relativePath;
+            this.targetKey = (this.targetDir + '/' + relativePath).toLowerCase();
+            const encodedSegments = relativePath.split('/').map(seg => encodeURIComponent(seg)).join('/');
+            this.targetUrl = (this.targetDir === '/' ? '' : this.targetDir) + '/' + encodedSegments;
+        }
+
+        renameWithSuffix(suffixNumber = 1) {
+            const parts = this.rawRelative.split('/');
+            const fullName = parts[parts.length - 1];
+            const dotIdx = fullName.lastIndexOf('.');
+            let base = fullName;
+            let ext = '';
+            if (dotIdx > 0) {
+                base = fullName.slice(0, dotIdx);
+                ext = fullName.slice(dotIdx);
+            }
+            const newFullName = `${base} (${suffixNumber})${ext}`;
+            parts[parts.length - 1] = newFullName;
+            this.relativePath = parts.join('/');
+            this.setTargetName(this.relativePath);
         }
 
         start() {
@@ -906,29 +1090,45 @@
             this.status = 'running';
             this.errorMessage = '';
             const generation = ++this.generation;
-            // 仅恢复本任务已经开始的上传；同名文件不能仅按大小判断内容相同。
+            this.probe(generation);
+            TransferManager.onTaskUpdated();
+        }
+
+        probe(generation) {
             const xhr = this.xhr = new XMLHttpRequest();
             xhr.open('HEAD', this.targetUrl, true);
             xhr.timeout = TRANSFER_LIMITS.headMs;
-            xhr.onload = () => {
+            xhr.onload = async () => {
                 if (!this.isCurrent(generation)) return;
                 const rawLength = xhr.getResponseHeader('Content-Length');
                 const length = rawLength === null ? NaN : Number(rawLength);
-                if (!this.attempted && xhr.status >= 200 && xhr.status < 300) {
-                    this.fail(generation, '目标文件已存在，请重命名后上传，避免误覆盖');
-                    return;
-                }
+
                 if (xhr.status === 404) {
+                    // 目标文件不存在，从 0 字节全新上传
                     this.serverOffset = this.uploadedBytes = 0;
-                } else if (xhr.status >= 200 && xhr.status < 300 &&
-                    Number.isSafeInteger(length) && length >= 0 && length <= this.totalBytes) {
-                    this.serverOffset = this.uploadedBytes = length;
-                } else {
-                    this.fail(generation, '无法确认上传断点，请取消后重新上传');
+                    this.executeTransfer(generation);
                     return;
                 }
-                if (this.attempted && this.serverOffset === this.totalBytes && this.totalBytes > 0) this.complete(generation);
-                else this.executeTransfer(generation);
+
+                if (xhr.status >= 200 && xhr.status < 300 && Number.isSafeInteger(length) && length >= 0) {
+                    // 服务端已存在同名文件
+                    if (length < this.totalBytes) {
+                        // 未传完，支持断点续传
+                        this.serverOffset = this.uploadedBytes = length;
+                        this.executeTransfer(generation);
+                        return;
+                    } else if (length === this.totalBytes) {
+                        // 大小完全相等！进行 SHA-256 智能查重比对
+                        await this.verifyDuplicate(generation);
+                        return;
+                    } else {
+                        // 服务端同名文件比当前文件还大，说明是同名不同内容文件，自动改名续传
+                        this.autoRenameAndRetry(generation);
+                        return;
+                    }
+                } else {
+                    this.fail(generation, '无法确认上传断点，请取消后重试');
+                }
             };
             xhr.onerror = () => this.fail(generation, '上传断点探测失败');
             xhr.ontimeout = () => this.fail(generation, '上传断点探测超时（10 s）');
@@ -936,8 +1136,163 @@
             TransferManager.onTaskUpdated();
         }
 
+        async verifyDuplicate(generation) {
+            if (!this.isCurrent(generation)) return;
+            this.status = 'verifying';
+            this.speed = this.eta = 0;
+            this.readBytes = 0;
+            TransferManager.onTaskUpdated();
+
+            try {
+                const controller = this.hashAbortController = new AbortController();
+                const signal = controller.signal;
+
+                // 核心：三级漏斗极速指纹比对 (10ms 判定不同改名，0.05s 秒传相同)
+                const isIdentical = await this.probeFastFingerprint(signal);
+                if (!this.isCurrent(generation)) return;
+
+                if (isIdentical) {
+                    // 内容完全相同！直接秒传完成，绝对不重命名，绝不重新上传！
+                    this.uploadedBytes = this.totalBytes;
+                    this.complete(generation, true);
+                } else {
+                    // 确实不同，自动改名上传
+                    this.autoRenameAndRetry(generation);
+                }
+            } catch (err) {
+                if (this.isCurrent(generation)) {
+                    // 异常防御兜底
+                    this.autoRenameAndRetry(generation);
+                }
+            }
+        }
+
+        async probeFastFingerprint(signal) {
+            const size = this.totalBytes;
+            if (size === 0) return true;
+
+            const fetchServerRange = async (start, end) => {
+                const resp = await fetch(this.targetUrl, {
+                    headers: { 'Range': `bytes=${start}-${end}` },
+                    cache: 'no-store',
+                    signal
+                });
+                const needed = end - start + 1;
+                if (resp.status === 206) {
+                    const buf = await resp.arrayBuffer();
+                    return buf.byteLength === needed ? buf : buf.slice(0, needed);
+                } else if (resp.status === 200) {
+                    // 降级保护：如果代理未返回 206 而是返回了 200，流式仅读取前 needed 字节，绝不读取整文件！
+                    const reader = resp.body.getReader();
+                    const chunks = [];
+                    let received = 0;
+                    while (received < needed) {
+                        const { done, value } = await reader.read();
+                        if (done || !value) break;
+                        chunks.push(value);
+                        received += value.length;
+                    }
+                    reader.cancel().catch(() => {});
+                    const merged = new Uint8Array(received);
+                    let pos = 0;
+                    for (const c of chunks) { merged.set(c, pos); pos += c.length; }
+                    return merged.subarray(0, needed).buffer;
+                }
+                throw new Error(`Range fetch failed: HTTP ${resp.status}`);
+            };
+
+            const areBuffersEqual = (bufA, bufB) => {
+                if (bufA.byteLength !== bufB.byteLength) return false;
+                const a = new Uint8Array(bufA);
+                const b = new Uint8Array(bufB);
+                for (let i = 0; i < a.length; i++) {
+                    if (a[i] !== b[i]) return false;
+                }
+                return true;
+            };
+
+            const sliceBytes = Math.min(65536, size);
+
+            // 第一级：首尾微切片比对 (64KB + 64KB) —— 耗时 ~10ms
+            const localHeadPromise = this.file.slice(0, sliceBytes).arrayBuffer();
+            const serverHeadPromise = fetchServerRange(0, sliceBytes - 1);
+
+            let localTailPromise = null;
+            let serverTailPromise = null;
+            if (size > sliceBytes) {
+                const tailStart = size - sliceBytes;
+                localTailPromise = this.file.slice(tailStart, size).arrayBuffer();
+                serverTailPromise = fetchServerRange(tailStart, size - 1);
+            }
+
+            const [localHead, serverHead] = await Promise.all([localHeadPromise, serverHeadPromise]);
+            if (!areBuffersEqual(localHead, serverHead)) {
+                return false; // 首部不同，0.01 秒断定不同！
+            }
+
+            if (localTailPromise && serverTailPromise) {
+                const [localTail, serverTail] = await Promise.all([localTailPromise, serverTailPromise]);
+                if (!areBuffersEqual(localTail, serverTail)) {
+                    return false; // 尾部不同，0.01 秒断定不同！
+                }
+            }
+
+            // 第二级 / 第三级比对
+            if (size <= 32 * 1024 * 1024) {
+                try {
+                    const [serverHash, localBuffer] = await Promise.all([
+                        fetch(this.targetUrl + '?hash', { signal, cache: 'no-store' })
+                            .then(r => r.ok ? r.text() : '')
+                            .then(t => t.trim().toLowerCase()),
+                        this.file.arrayBuffer()
+                    ]);
+                    if (serverHash && window.crypto && window.crypto.subtle) {
+                        const digest = await window.crypto.subtle.digest('SHA-256', localBuffer);
+                        const localHash = Array.from(new Uint8Array(digest))
+                            .map(b => b.toString(16).padStart(2, '0')).join('');
+                        return serverHash === localHash;
+                    }
+                } catch (_) {}
+                return true;
+            }
+
+            // 超大文件 (> 32MB) 四分位点抽样
+            const sampleOffsets = [
+                Math.floor(size * 0.25),
+                Math.floor(size * 0.50),
+                Math.floor(size * 0.75)
+            ];
+
+            for (const offset of sampleOffsets) {
+                const end = Math.min(offset + sliceBytes, size);
+                const [localBuf, serverBuf] = await Promise.all([
+                    this.file.slice(offset, end).arrayBuffer(),
+                    fetchServerRange(offset, end - 1)
+                ]);
+                if (!areBuffersEqual(localBuf, serverBuf)) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        autoRenameAndRetry(generation) {
+            if (!this.isCurrent(generation)) return;
+            this.renameCount = (this.renameCount || 0) + 1;
+            if (this.renameCount > 50) {
+                this.fail(generation, '同名文件过多，请重命名后上传');
+                return;
+            }
+            this.renameWithSuffix(this.renameCount);
+            this.status = 'running';
+            this.serverOffset = this.uploadedBytes = 0;
+            this.readBytes = 0;
+            this.probe(generation);
+        }
+
         isCurrent(generation) {
-            return generation === this.generation && this.status === 'running';
+            return generation === this.generation && ['running', 'verifying'].includes(this.status);
         }
 
         executeTransfer(generation) {
@@ -951,7 +1306,7 @@
             let lastLoaded = offset;
             const armIdle = () => {
                 clearTimeout(this.timer);
-                this.timer = setTimeout(() => this.fail(generation, '上传无进展超时（60 s），可继续重试'), TRANSFER_LIMITS.idleMs);
+                this.timer = setTimeout(() => this.retryTransfer(generation, '上传无进展超时（60 s）'), TRANSFER_LIMITS.idleMs);
             };
             xhr.upload.onprogress = event => {
                 if (!this.isCurrent(generation)) return;
@@ -969,27 +1324,58 @@
             xhr.onload = () => {
                 if (!this.isCurrent(generation)) return;
                 clearTimeout(this.timer);
-                if (xhr.status < 200 || xhr.status >= 300) {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    this.retryCount = 0; // 成功传输一块，重试计数清零！
+                    this.serverOffset = this.uploadedBytes = end;
+                    if (end === this.totalBytes) this.complete(generation);
+                    else this.executeTransfer(generation);
+                } else if (xhr.status >= 500 || xhr.status === 408) {
+                    // 服务端临时 5xx 或 408 超时，自动平滑重试
+                    this.retryTransfer(generation, `HTTP ${xhr.status} 错误`);
+                } else {
                     this.fail(generation, `HTTP ${xhr.status}`);
-                    return;
                 }
-                this.serverOffset = this.uploadedBytes = end;
-                if (end === this.totalBytes) this.complete(generation);
-                else this.executeTransfer(generation);
             };
-            xhr.onerror = () => this.fail(generation, '网络连接中断，可继续重试');
+            xhr.onerror = () => this.retryTransfer(generation, '网络连接中断');
+            xhr.ontimeout = () => this.retryTransfer(generation, '请求超时');
             this.attempted = true;
             armIdle();
             try { xhr.send(this.file.slice(offset, end)); }
-            catch (error) { this.fail(generation, error.message); }
+            catch (error) { this.retryTransfer(generation, error.message); }
         }
 
-        complete(generation) {
+        retryTransfer(generation, reason) {
+            if (!this.isCurrent(generation)) return;
+            clearTimeout(this.timer);
+            clearTimeout(this.retryTimer);
+            const xhr = this.xhr;
+            this.xhr = null;
+            if (xhr) { try { xhr.abort(); } catch (_) {} }
+
+            if (this.retryCount < (this.maxRetries || 5)) {
+                this.retryCount = (this.retryCount || 0) + 1;
+                const delay = Math.min(800 * Math.pow(1.5, this.retryCount - 1), 4000);
+                this.speed = 0;
+                TransferManager.onTaskUpdated();
+                this.retryTimer = setTimeout(() => {
+                    if (this.isCurrent(generation)) {
+                        this.executeTransfer(generation);
+                    }
+                }, delay);
+            } else {
+                this.fail(generation, reason ? `${reason}，可继续重试` : '网络连接中断，可继续重试');
+            }
+        }
+
+        complete(generation, isFastSkip = false) {
             if (!this.isCurrent(generation)) return;
             this.stopRequest();
             this.status = 'completed';
             this.uploadedBytes = this.totalBytes;
             this.file = null;
+            if (isFastSkip) {
+                showToast(`"${this.filename}" 内容完全相同，已秒传完成`, 'info', 3000);
+            }
             TransferManager.onTaskUpdated();
             TransferManager.triggerDirectoryRefresh();
             TransferManager.scheduleNext();
@@ -1006,7 +1392,12 @@
 
         stopRequest() {
             ++this.generation;
+            clearTimeout(this.retryTimer);
             clearTimeout(this.timer);
+            if (this.hashAbortController) {
+                try { this.hashAbortController.abort(); } catch (_) {}
+                this.hashAbortController = null;
+            }
             const xhr = this.xhr;
             this.xhr = null;
             if (xhr) xhr.abort();
@@ -1014,7 +1405,7 @@
         }
 
         pause() {
-            if (!['running', 'pending'].includes(this.status)) return;
+            if (!['running', 'verifying', 'pending'].includes(this.status)) return;
             this.stopRequest();
             this.status = 'paused';
             TransferManager.onTaskUpdated();
@@ -1023,6 +1414,7 @@
 
         resume() {
             if (!['paused', 'error'].includes(this.status)) return;
+            this.retryCount = 0;
             this.status = 'pending';
             TransferManager.scheduleNext();
         }
@@ -1189,7 +1581,11 @@
             const fsTip = document.getElementById('fsSupportTip');
             const checkAsk = document.getElementById('checkAskSaveLocation');
 
-            if (checkAsk) checkAsk.checked = this.askSaveLocation;
+            if (checkAsk) {
+                checkAsk.checked = this.askSaveLocation;
+                checkAsk.disabled = typeof window.showSaveFilePicker !== 'function';
+                checkAsk.title = checkAsk.disabled ? '当前环境不支持保存选择器，已有询问设置将等待你选择下载方式' : '';
+            }
 
             if (!this.isSupported()) {
                 if (radioCustom) radioCustom.disabled = true;
@@ -1216,14 +1612,34 @@
         }
     };
 
+    // 所有原生下载共用交接队列；浏览器实际传输不计入网页并发。
+    const NativeDownloadQueue = {
+        tail: Promise.resolve(),
+        lastStarted: -Infinity,
+        send(filename, url, current) {
+            const job = this.tail.then(async () => {
+                while (performance.now() - this.lastStarted < 750) {
+                    const delay = Math.max(1, Math.ceil(750 - (performance.now() - this.lastStarted)));
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+                if (!current()) return false;
+                triggerDirectNativeDownload(filename, url);
+                this.lastStarted = performance.now();
+                return true;
+            });
+            this.tail = job.catch(() => {});
+            return job;
+        }
+    };
+
     class DownloadTask {
         constructor(filename, fileUrl, totalBytes) {
             this.id = 'down_' + Math.random().toString(36).slice(2);
             this.filename = filename;
             this.fileUrl = fileUrl;
-            this.totalBytes = Number.isSafeInteger(totalBytes) && totalBytes > 0 ? totalBytes : null;
+            this.totalBytes = Number.isSafeInteger(totalBytes) && totalBytes >= 0 ? totalBytes : null;
             this.receivedBytes = 0;
-            this.status = 'pending';
+            this.status = DownloadPathManager.askSaveLocation ? 'awaiting-save' : 'pending';
             this.chunks = [];
             this.speed = this.eta = 0;
             this.errorMessage = '';
@@ -1235,44 +1651,108 @@
             this.savedLocation = '';
             this.fileHandle = null;
             this.writable = null;
+            this.targetMode = DownloadPathManager.askSaveLocation ? 'ask' : DownloadPathManager.mode;
+            this.dirHandle = DownloadPathManager.customDirHandle;
         }
 
-        async start() {
-            if (this.status !== 'pending' || this.runPromise) return;
-
-            // 检测下载目标路径模式 (自定义目录 vs 默认路径)
-            let dirHandle = null;
-            if (DownloadPathManager.mode === 'custom' && DownloadPathManager.isSupported()) {
-                dirHandle = await DownloadPathManager.getDirectoryHandle();
-                if (dirHandle) {
-                    this.savedLocation = DownloadPathManager.customDirName || '自定义本地目录';
-                }
-            }
-            if (!this.savedLocation) {
-                this.savedLocation = '浏览器默认下载目录';
-            }
-
-            // 针对默认路径下的超大文件 (大于 50MB)，直接分流交由浏览器原生下载直存磁盘，实现零 JS 内存占用
-            const LARGE_FILE_THRESHOLD = 50 * 1024 * 1024;
-            if (!dirHandle && this.totalBytes && this.totalBytes > LARGE_FILE_THRESHOLD) {
-                this.status = 'completed';
-                this.receivedBytes = this.totalBytes;
-                triggerDirectNativeDownload(this.filename, this.fileUrl);
-                showToast(`大文件 "${this.filename}" (${formatBytes(this.totalBytes)}) 已由浏览器内核接管直存磁盘`, 'info', 4000);
-                TransferManager.updateTaskProgressDOM(this);
+        // 必须由用户点击直接调用，让保存选择器保有用户激活。
+        async chooseLocation() {
+            if (this.runPromise || !['awaiting-save', 'error'].includes(this.status)) return;
+            if (typeof window.showSaveFilePicker !== 'function') {
+                this.errorMessage = '当前环境不支持保存选择器；可点击“使用浏览器下载”';
                 TransferManager.onTaskUpdated();
-                TransferManager.scheduleNext();
                 return;
             }
+            this.status = 'choosing';
+            TransferManager.onTaskUpdated();
+            try {
+                const handle = await window.showSaveFilePicker({ suggestedName: this.filename });
+                if (this.status !== 'choosing') return;
+                await this.discardPartial();
+                this.fileHandle = handle;
+                this.targetMode = 'ask';
+                this.savedLocation = handle.name;
+                this.errorMessage = '';
+                this.status = TransferManager.suspended ? 'paused' : 'pending';
+                TransferManager.scheduleNext();
+            } catch (error) {
+                if (this.status !== 'choosing') return;
+                this.status = error.name === 'AbortError' ? 'awaiting-save' : 'error';
+                this.errorMessage = error.name === 'AbortError' ? '' : `选择保存位置失败：${error.message}`;
+            }
+            TransferManager.onTaskUpdated();
+        }
 
+        async useBrowser() {
+            if (this.runPromise || !['awaiting-save', 'error'].includes(this.status)) return;
+            this.status = 'resetting';
+            await this.discardPartial();
+            this.fileHandle = null;
+            this.targetMode = 'default';
+            this.savedLocation = '浏览器默认下载目录';
+            this.status = TransferManager.suspended ? 'paused' : 'pending';
+            TransferManager.scheduleNext();
+        }
+
+        start() {
+            if (this.status !== 'pending' || this.runPromise) return;
+            if (this.targetMode === 'ask' && !this.fileHandle) {
+                this.status = 'awaiting-save';
+                TransferManager.onTaskUpdated();
+                return;
+            }
             this.status = 'running';
             this.errorMessage = '';
             this.resumeRequested = false;
             const generation = ++this.generation;
-            this.runPromise = Promise.resolve().then(() => this.run(generation, dirHandle));
+            this.runPromise = Promise.resolve().then(() => this.run(generation));
         }
 
-        validateResponse(response, offset, dirHandle) {
+        async discardPartial() {
+            if (this.writable) {
+                const writable = this.writable;
+                this.writable = null;
+                try { await writable.abort(); } catch (_) {}
+            }
+            this.receivedBytes = 0;
+            this.validator = null;
+            this.chunks = [];
+        }
+
+        async prepareTarget() {
+            if (this.writable) return;
+            if (this.targetMode === 'custom' && !this.fileHandle) {
+                if (!this.dirHandle) throw new Error('自定义保存目录不可用，请重新选择保存位置');
+                const permission = await this.dirHandle.queryPermission({ mode: 'readwrite' });
+                if (permission !== 'granted') throw new Error('保存目录权限未授予，请点击“选择保存位置”');
+                try {
+                    await this.dirHandle.getFileHandle(this.filename, { create: false });
+                } catch (error) {
+                    if (error.name !== 'NotFoundError') throw error;
+                    this.fileHandle = await this.dirHandle.getFileHandle(this.filename, { create: true });
+                }
+                if (!this.fileHandle) throw new Error('保存目录已有同名文件，请选择其他保存位置');
+                this.savedLocation = this.dirHandle.name;
+            }
+            if (this.fileHandle) {
+                // 同一页面内的多个任务也不能同时写入同一目标。
+                for (const other of TransferManager.downloadTasks) {
+                    if (other === this || !other.fileHandle || ['cancelled', 'handedoff'].includes(other.status)) continue;
+                    if (await this.fileHandle.isSameEntry(other.fileHandle)) {
+                        this.fileHandle = null;
+                        throw new Error('该保存位置已被其他下载任务使用，请另选位置');
+                    }
+                }
+                this.writable = await this.fileHandle.createWritable();
+            } else if (this.targetMode !== 'default') {
+                throw new Error('请先选择保存位置');
+            } else {
+                this.savedLocation = '浏览器默认下载目录';
+            }
+        }
+
+        validateResponse(response, offset) {
+            if (offset && response.status === 416) throw new Error('RESTART_NEEDED');
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const rawLength = response.headers.get('Content-Length');
             const length = rawLength === null ? null : Number(rawLength);
@@ -1280,60 +1760,49 @@
             const etag = response.headers.get('ETag');
             const validator = etag && !etag.startsWith('W/') ? { name: 'ETag', value: etag } :
                 response.headers.get('Last-Modified') ? { name: 'Last-Modified', value: response.headers.get('Last-Modified') } : null;
-
-            const LARGE_FILE_THRESHOLD = 50 * 1024 * 1024;
-            // 若默认路径下首包发现实际长度大于阈值，立即原生交接
-            if (!dirHandle && offset === 0 && length !== null && length > LARGE_FILE_THRESHOLD) {
-                this.totalBytes = length;
-                this.receivedBytes = length;
-                this.status = 'completed';
-                triggerDirectNativeDownload(this.filename, this.fileUrl);
-                showToast(`大文件 "${this.filename}" (${formatBytes(length)}) 已由浏览器内核直存磁盘`, 'info', 4000);
-                throw new Error('NATIVE_DOWNLOAD_HANDLED');
-            }
-
             if (offset) {
-                if (this.validator && validator && this.validator.value !== validator.value) {
-                    throw new Error('RESTART_NEEDED');
-                }
                 const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('Content-Range') || '');
-                if (response.status === 416 || response.status !== 206 || !range || !range.slice(1).every(n => Number.isSafeInteger(Number(n))) || Number(range[1]) !== offset) {
-                    throw new Error('RESTART_NEEDED');
-                }
+                if (!this.validator || !validator || this.validator.name !== validator.name || this.validator.value !== validator.value ||
+                    response.status !== 206 || !range || !range.slice(1).every(n => Number.isSafeInteger(Number(n))) ||
+                    Number(range[1]) !== offset || Number(range[2]) < offset || Number(range[2]) + 1 !== Number(range[3]) ||
+                    (length !== null && length !== Number(range[2]) - offset + 1) ||
+                    (this.totalBytes !== null && this.totalBytes !== Number(range[3]))) throw new Error('RESTART_NEEDED');
                 this.totalBytes = Number(range[3]);
             } else {
-                if (response.status !== 200 && response.status !== 206) throw new Error(`下载响应状态不匹配 (HTTP ${response.status})`);
-                if (length !== null) this.totalBytes = length;
+                if (response.status !== 200) throw new Error(`下载响应状态不匹配 (HTTP ${response.status})`);
+                this.totalBytes = length;
                 this.validator = validator;
             }
             return length;
         }
 
-        async run(generation, dirHandle) {
+        async handoff(url, current) {
+            if (!await NativeDownloadQueue.send(this.filename, url, current)) return;
+            this.status = 'handedoff';
+            showToast(`“${this.filename}”已交给浏览器，请在浏览器下载列表查看结果`, 'info', 4000);
+        }
+
+        async run(generation) {
             const current = () => generation === this.generation && this.status === 'running';
             const controller = this.abortController = new AbortController();
-            let response;
-            let reader;
-            let timer;
+            let response, reader, timer;
             let timedOut = false;
+            let diskOperation = false;
+            let restartNeeded = false;
             const armIdle = () => {
                 clearTimeout(timer);
                 timer = setTimeout(() => { timedOut = true; controller.abort(); }, TRANSFER_LIMITS.idleMs);
             };
             try {
                 if (!current()) return;
-
-                // 若指定了自定义本地目录，初始化直接流式文件可写流
-                if (dirHandle && !this.writable) {
-                    try {
-                        this.fileHandle = await dirHandle.getFileHandle(this.filename, { create: true });
-                        this.writable = await this.fileHandle.createWritable();
-                    } catch (e) {
-                        this.writable = null;
-                        this.fileHandle = null;
-                    }
+                diskOperation = true;
+                await this.prepareTarget();
+                diskOperation = false;
+                if (!current()) return;
+                if (this.targetMode === 'default' && this.totalBytes > 50 * 1024 * 1024) {
+                    await this.handoff(this.fileUrl, current);
+                    return;
                 }
-
                 const offset = this.receivedBytes;
                 const headers = {};
                 if (offset > 0) {
@@ -1343,30 +1812,32 @@
                 armIdle();
                 response = await fetch(this.fileUrl, { method: 'GET', headers, signal: controller.signal });
                 if (!current()) return;
-                
-                const length = this.validateResponse(response, offset, dirHandle);
+                this.validateResponse(response, offset);
                 clearTimeout(timer);
-                
+                if (this.targetMode === 'default' && offset === 0 && this.totalBytes > 50 * 1024 * 1024) {
+                    controller.abort();
+                    await this.handoff(this.fileUrl, current);
+                    return;
+                }
                 reader = response.body.getReader();
                 let lastTime = performance.now();
                 let lastLoaded = this.receivedBytes;
-                if (!this.writable && !this.chunks) this.chunks = [];
-
-                while (reader && current()) {
+                while (current()) {
                     armIdle();
                     const { done, value } = await reader.read();
                     clearTimeout(timer);
                     if (!current()) return;
                     if (timedOut) throw new Error('下载无进展超时（60 s），可继续重试');
                     if (done) break;
-
                     if (this.writable) {
+                        diskOperation = true;
                         await this.writable.write(value);
+                        diskOperation = false;
                     } else {
                         this.chunks.push(value);
                     }
+                    // write 完成后才确认偏移；暂停期间也等待这一块写入结束。
                     this.receivedBytes += value.byteLength;
-
                     const now = performance.now();
                     if (now - lastTime >= 200) {
                         this.speed = (this.receivedBytes - lastLoaded) * 1000 / (now - lastTime);
@@ -1377,52 +1848,40 @@
                     }
                 }
                 if (!current()) return;
-
-                // 下载完成，进入落盘收尾阶段
+                if (this.totalBytes !== null && this.receivedBytes !== this.totalBytes) throw new Error('下载数据长度不完整，可继续重试');
                 this.status = 'finishing';
                 this.speed = this.eta = 0;
-                TransferManager.updateTaskProgressDOM(this);
                 TransferManager.onTaskUpdated();
-
                 if (this.writable) {
+                    diskOperation = true;
                     await this.writable.close();
                     this.writable = null;
-                } else if (this.chunks) {
-                    // 组装 Blob 并触发保存落盘，清空内存引用
+                    diskOperation = false;
+                    this.status = 'completed';
+                } else {
                     const blob = new Blob(this.chunks, { type: 'application/octet-stream' });
-                    this.chunks.length = 0;
-                    this.chunks = null;
+                    this.chunks = [];
                     const blobUrl = URL.createObjectURL(blob);
-                    triggerDirectNativeDownload(this.filename, blobUrl);
-                    setTimeout(() => URL.revokeObjectURL(blobUrl), 1500);
+                    try {
+                        await this.handoff(blobUrl, () => generation === this.generation && this.status === 'finishing');
+                    } finally {
+                        setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+                    }
                 }
-
-                this.status = 'completed';
             } catch (error) {
-                if (error.message === 'NATIVE_DOWNLOAD_HANDLED') {
-                    TransferManager.updateTaskProgressDOM(this);
-                    TransferManager.onTaskUpdated();
-                    TransferManager.scheduleNext();
+                if (diskOperation) {
+                    await this.discardPartial();
+                } else if (this.status === 'cancelling' || (this.status === 'pausing' && !timedOut)) {
                     return;
                 }
-                if (error.message === 'RESTART_NEEDED') {
-                    if (this.writable) {
-                        try { await this.writable.abort(); } catch (_) {}
-                        this.writable = null;
-                    }
-                    this.chunks = [];
-                    this.receivedBytes = 0;
-                    this.validator = null;
-                    if (current()) {
-                        this.run(generation, dirHandle);
-                        return;
-                    }
+                if (error.message === 'RESTART_NEEDED' && current()) {
+                    restartNeeded = true;
+                } else if (this.status !== 'cancelling') {
+                    this.status = 'error';
+                    this.resumeRequested = false;
+                    this.errorMessage = diskOperation ? `保存文件失败：${error.message}` :
+                        timedOut ? '下载无进展超时（60 s），可继续重试' : error.message;
                 }
-                if (this.status === 'cancelling') return;
-                if (this.status === 'pausing' && !timedOut) return;
-                this.status = 'error';
-                this.resumeRequested = false;
-                this.errorMessage = timedOut ? '下载无进展超时（60 s），可继续重试' : error.message;
             } finally {
                 clearTimeout(timer);
                 controller.abort();
@@ -1430,19 +1889,13 @@
                     if (reader) await reader.cancel();
                     else if (response && response.body) await response.body.cancel();
                 } catch (_) {}
-
-                if (this.writable && this.status !== 'completed') {
-                    try { await this.writable.abort(); } catch (_) {}
-                    this.writable = null;
-                }
-
+                if (restartNeeded || this.status === 'cancelling') await this.discardPartial();
                 if (this.status === 'cancelling') {
-                    if (this.chunks) {
-                        this.chunks.length = 0;
-                        this.chunks = null;
-                    }
+                    this.fileHandle = null;
                     this.status = 'cancelled';
                     TransferManager.removeDownloadTask(this.id);
+                } else if (restartNeeded && current()) {
+                    this.status = TransferManager.suspended ? 'paused' : 'pending';
                 } else if (this.status === 'pausing') {
                     this.status = this.resumeRequested && !TransferManager.suspended ? 'pending' : 'paused';
                 }
@@ -1469,41 +1922,33 @@
         resume() {
             if (this.status === 'pausing') { this.resumeRequested = true; return; }
             if (!['paused', 'error'].includes(this.status) || this.runPromise) return;
-            this.status = 'pending';
+            this.status = this.targetMode === 'ask' && !this.fileHandle ? 'awaiting-save' : 'pending';
             TransferManager.scheduleNext();
         }
 
-        restart() {
+        async restart() {
             if (this.status !== 'error' || this.runPromise) return;
-            if (this.chunks) {
-                this.chunks.length = 0;
-                this.chunks = null;
-            }
-            this.receivedBytes = 0;
+            this.status = 'resetting';
+            await this.discardPartial();
             this.totalBytes = null;
-            this.validator = null;
             this.status = TransferManager.suspended ? 'paused' : 'pending';
-            TransferManager.onTaskUpdated();
             TransferManager.scheduleNext();
         }
 
-        cancel() {
-            if (['finishing', 'cancelling'].includes(this.status)) return;
+        async cancel() {
+            if (['finishing', 'cancelling', 'resetting'].includes(this.status)) return;
             ++this.generation;
             this.status = 'cancelling';
             this.resumeRequested = false;
             if (this.abortController) this.abortController.abort();
-            if (this.chunks) {
-                this.chunks.length = 0;
-                this.chunks = null;
-            }
             TransferManager.onTaskUpdated();
             if (this.runPromise) return;
+            await this.discardPartial();
+            this.fileHandle = null;
             this.status = 'cancelled';
             TransferManager.removeDownloadTask(this.id);
         }
     }
-
 
     const TransferManager = {
         uploadTasks: [],
@@ -1543,7 +1988,7 @@
 
         addDownloadFile(filename, fileUrl, totalBytes, defer = false) {
             const task = new DownloadTask(filename, fileUrl, totalBytes);
-            if (this.suspended) task.status = 'paused';
+            if (this.suspended && task.status === 'pending') task.status = 'paused';
             this.downloadTasks.push(task);
             if (!defer) {
                 this.openDrawer('download');
@@ -1556,7 +2001,7 @@
         async addDownloadFiles(files) {
             if (!files.length) return;
             this.openDrawer('download');
-            const activeUrls = new Set(this.downloadTasks.filter(t => !['completed', 'cancelled'].includes(t.status)).map(t => t.fileUrl.toLowerCase()));
+            const activeUrls = new Set(this.downloadTasks.filter(t => !['completed', 'handedoff', 'cancelled'].includes(t.status)).map(t => t.fileUrl.toLowerCase()));
             let skipped = 0;
             let added = 0;
             for (let i = 0; i < files.length; i++) {
@@ -1576,6 +2021,16 @@
             showToast(`已添加 ${added} 个下载任务${skipped ? `，跳过 ${skipped} 个已在队列的任务` : ''}`, 'info');
         },
 
+        chooseDownloadLocation(id) {
+            const task = this.downloadTasks.find(t => t.id === id);
+            if (task) task.chooseLocation();
+        },
+
+        useBrowserDownload(id) {
+            const task = this.downloadTasks.find(t => t.id === id);
+            if (task) task.useBrowser();
+        },
+
         restartDownloadTask(id) {
             const task = this.downloadTasks.find(t => t.id === id);
             if (task) task.restart();
@@ -1586,10 +2041,10 @@
             this.scheduling = true;
             try {
                 // 上传并发调度 (上限 maxConcurrent: 3)
-                let runningUploads = this.uploadTasks.filter(t => t.runPromise || ['running', 'pausing', 'cancelling'].includes(t.status)).length;
+                let runningUploads = this.uploadTasks.filter(t => t.runPromise || ['running', 'verifying', 'pausing', 'cancelling'].includes(t.status)).length;
                 for (const task of this.uploadTasks) {
                     if (runningUploads >= this.maxConcurrent) break;
-                    if (task.status !== 'pending') continue;
+                    if (task.native || task.status !== 'pending') continue;
                     runningUploads++;
                     try { task.start(); }
                     catch (error) {
@@ -1604,8 +2059,10 @@
                 for (const task of this.downloadTasks) {
                     if (runningDownloads >= (this.maxConcurrentDownloads || 2)) break;
                     if (task.status !== 'pending') continue;
-                    runningDownloads++;
-                    try { task.start(); }
+                    try {
+                        task.start();
+                        if (task.runPromise) runningDownloads++;
+                    }
                     catch (error) {
                         task.status = 'error';
                         task.errorMessage = error.message;
@@ -1620,7 +2077,7 @@
             this.uploadTasks.forEach(t => t.pause());
             this.downloadTasks.forEach(t => t.pause());
             this.onTaskUpdated();
-            showToast('已暂停所有传输任务', 'info');
+            showToast('已暂停可暂停的传输任务；其他任务可单独取消', 'info');
         },
 
         resumeAll() {
@@ -1637,8 +2094,9 @@
         },
 
         clearCompleted() {
+            this.uploadTasks.filter(t => t.native && ['completed', 'cancelled'].includes(t.status)).forEach(t => LocalCopy.removed.add(t.id));
             this.uploadTasks = this.uploadTasks.filter(t => !['completed', 'cancelled'].includes(t.status));
-            this.downloadTasks = this.downloadTasks.filter(t => !['completed', 'cancelled'].includes(t.status));
+            this.downloadTasks = this.downloadTasks.filter(t => !['completed', 'handedoff', 'cancelled'].includes(t.status));
             this.onTaskUpdated();
             showToast('已清空所有已完成任务记录', 'info');
         },
@@ -1658,8 +2116,9 @@
         updateTaskProgressDOM(task) {
             const card = document.getElementById(task.id);
             if (!card) return;
-            const isUpload = task.id.startsWith('up_');
-            const currentBytes = isUpload ? task.uploadedBytes : task.receivedBytes;
+            const isUpload = task.id.startsWith('up_') || task.native;
+            const verifying = isUpload && task.status === 'verifying';
+            const currentBytes = isUpload ? (verifying ? (task.readBytes || 0) : task.uploadedBytes) : task.receivedBytes;
             const percent = task.totalBytes > 0 ? Math.min(100, currentBytes * 100 / task.totalBytes).toFixed(1) : (task.status === 'completed' ? 100 : 0);
 
             // 更新进度条
@@ -1679,7 +2138,7 @@
             // 更新已传大小 / 进度百分比 / 速度 / ETA
             const metaSpans = card.querySelectorAll('.task-meta-row span');
             if (metaSpans.length >= 2) {
-                metaSpans[0].textContent = `${formatBytes(currentBytes)} / ${task.totalBytes === null ? '总大小未知' : formatBytes(task.totalBytes) + ' (' + percent + '%)'}`;
+                metaSpans[0].textContent = `${verifying ? '已校验 ' : ''}${formatBytes(currentBytes)} / ${task.totalBytes === null ? '总大小未知' : formatBytes(task.totalBytes) + ' (' + percent + '%)'}`;
                 metaSpans[1].textContent = task.status === 'running' ? formatSpeed(task.speed) + (task.totalBytes === null ? '' : ' · 剩余 ' + formatETA(task.eta)) : '';
             }
 
@@ -1735,7 +2194,7 @@
             let activeCount = 0;
 
             for (const t of this.uploadTasks) {
-                if (t.status === 'running') {
+                if (['running', 'verifying'].includes(t.status)) {
                     totalUpSpeed += t.speed;
                     activeCount++;
                 } else if (t.status === 'pending') {
@@ -1782,7 +2241,9 @@
                 uploadList.innerHTML = '<div class="task-empty-state"><p>暂无上传任务</p></div>';
             } else {
                 uploadList.innerHTML = this.taskPage('upload', this.uploadTasks).map(t => {
-                    const percent = t.totalBytes > 0 ? ((t.uploadedBytes / t.totalBytes) * 100).toFixed(1) : 0;
+                    const verifying = t.status === 'verifying';
+                    const currentBytes = verifying ? (t.readBytes || 0) : t.uploadedBytes;
+                    const percent = t.totalBytes > 0 ? ((currentBytes / t.totalBytes) * 100).toFixed(1) : t.status === 'completed' ? 100 : 0;
                     return `
                     <div class="task-card" id="${t.id}">
                         <div class="task-top">
@@ -1797,13 +2258,13 @@
                             <div class="task-progress-bar ${t.status}" style="width: ${percent}%"></div>
                         </div>
                         <div class="task-meta-row">
-                            <span>${formatBytes(t.uploadedBytes)} / ${formatBytes(t.totalBytes)} (${percent}%)</span>
+                            <span>${verifying ? '已校验 ' : ''}${formatBytes(currentBytes)} / ${formatBytes(t.totalBytes)} (${percent}%)</span>
                             <span>${t.status === 'running' ? formatSpeed(t.speed) + ' · 剩余 ' + formatETA(t.eta) : ''}</span>
                         </div>
                         <div class="task-actions">
-                            ${t.status === 'running' ? `<button class="task-action-btn" onclick="window.TransferManager.pauseTask('up', '${t.id}')">⏸ 暂停</button>` : ''}
-                            ${t.status === 'paused' || t.status === 'error' ? `<button class="task-action-btn" onclick="window.TransferManager.resumeTask('up', '${t.id}')">▶ 继续</button>` : ''}
-                            <button class="task-action-btn danger" onclick="window.TransferManager.cancelTask('up', '${t.id}')">✕ 取消</button>
+                            ${!t.native && ['running', 'verifying'].includes(t.status) ? `<button class="task-action-btn" onclick="window.TransferManager.pauseTask('up', '${t.id}')">⏸ 暂停</button>` : ''}
+                            ${!t.native && (t.status === 'paused' || t.status === 'error') ? `<button class="task-action-btn" onclick="window.TransferManager.resumeTask('up', '${t.id}')">▶ 继续</button>` : ''}
+                            <button class="task-action-btn danger" onclick="window.TransferManager.cancelTask('up', '${t.id}')">${['completed', 'cancelled'].includes(t.status) ? '移除记录' : '✕ 取消'}</button>
                         </div>
                     </div>`;
                 }).join('') + this.taskPager('upload', this.uploadTasks.length);
@@ -1814,7 +2275,7 @@
                 downloadList.innerHTML = '<div class="task-empty-state"><p>暂无下载任务</p></div>';
             } else {
                 downloadList.innerHTML = this.taskPage('download', this.downloadTasks).map(t => {
-                    const percent = t.totalBytes > 0 ? Math.min(100, t.receivedBytes * 100 / t.totalBytes).toFixed(1) : t.status === 'completed' ? 100 : 0;
+                    const percent = t.status === 'handedoff' ? 0 : t.totalBytes > 0 ? Math.min(100, t.receivedBytes * 100 / t.totalBytes).toFixed(1) : t.status === 'completed' ? 100 : 0;
                     return `
                     <div class="task-card" id="${t.id}">
                         <div class="task-top">
@@ -1830,7 +2291,7 @@
                             <div class="task-progress-bar ${t.status}" style="width: ${percent}%"></div>
                         </div>
                         <div class="task-meta-row">
-                            <span>${formatBytes(t.receivedBytes)} / ${t.totalBytes === null ? '总大小未知' : formatBytes(t.totalBytes) + ' (' + percent + '%)'}</span>
+                            <span>${t.status === 'handedoff' ? '保存结果以浏览器下载列表为准' : formatBytes(t.receivedBytes) + ' / ' + (t.totalBytes === null ? '总大小未知' : formatBytes(t.totalBytes) + ' (' + percent + '%)')}</span>
                             <span>${t.status === 'running' ? formatSpeed(t.speed) + (t.totalBytes === null ? '' : ' · 剩余 ' + formatETA(t.eta)) : ''}</span>
                         </div>
                         <div class="task-actions">
@@ -1840,7 +2301,12 @@
                             ` : ''}
                             ${t.status === 'running' ? `<button class="task-action-btn" onclick="window.TransferManager.pauseTask('down', '${t.id}')">⏸ 暂停</button>` : ''}
                             ${t.status === 'paused' || t.status === 'error' ? `<button class="task-action-btn" onclick="window.TransferManager.resumeTask('down', '${t.id}')">▶ 继续</button>` : ''}
-                            ${!['finishing', 'cancelling'].includes(t.status) ? `<button class="task-action-btn danger" onclick="window.TransferManager.cancelTask('down', '${t.id}')">${t.status === 'completed' ? '移除记录' : '✕ 取消'}</button>` : ''}
+                            ${['awaiting-save', 'error'].includes(t.status) ? `
+                                <button class="task-action-btn primary" onclick="window.TransferManager.chooseDownloadLocation('${t.id}')">选择保存位置</button>
+                                <button class="task-action-btn" onclick="window.TransferManager.useBrowserDownload('${t.id}')">使用浏览器下载</button>
+                            ` : ''}
+                            ${t.status === 'handedoff' ? '<span>请在浏览器下载列表管理进度和查看结果</span>' : ''}
+                            ${!['finishing', 'cancelling', 'resetting'].includes(t.status) ? `<button class="task-action-btn danger" onclick="window.TransferManager.cancelTask('down', '${t.id}')">${['completed', 'handedoff'].includes(t.status) ? '移除记录' : '✕ 取消'}</button>` : ''}
                         </div>
                     </div>`;
                 }).join('') + this.taskPager('download', this.downloadTasks.length);
@@ -1878,7 +2344,7 @@
                 detailBox.innerHTML = `
                     <p style="margin-bottom:6px;"><strong>保存目标：</strong>${isCustom ? `本地文件夹 [${escapeHtml(task.savedLocation)}]` : '系统默认「下载」文件夹 (Downloads)'}</p>
                     <p style="margin-bottom:6px;"><strong>文件大小：</strong>${formatBytes(task.receivedBytes || task.totalBytes || 0)}</p>
-                    <p><strong>落盘状态：</strong>100% 完整校验已落盘</p>
+                    <p><strong>落盘状态：</strong>文件已写入，保存提交成功</p>
                 `;
             }
 
@@ -1902,6 +2368,11 @@
 
         getStatusText(status) {
             const map = {
+                verifying: '校验查重中',
+                handedoff: '已交给浏览器',
+                'awaiting-save': '等待选择保存位置',
+                choosing: '正在选择位置',
+                resetting: '正在重新准备',
                 pending: '排队中',
                 running: '传输中',
                 paused: '已暂停',
@@ -2049,6 +2520,26 @@
         document.getElementById('upDirBtn').style.display = (state.currentPath === '/' ? 'none' : 'inline-flex');
     }
 
+    function updateTableHeaderSort() {
+        const [field, direction] = (state.sortBy || 'name-asc').split('-');
+        document.querySelectorAll('.file-table th.sortable').forEach(th => {
+            const sortKey = th.getAttribute('data-sort');
+            const baseLabel = th.getAttribute('data-label') || th.textContent.replace(/[↑↓\s]/g, '');
+            if (!th.getAttribute('data-label')) th.setAttribute('data-label', baseLabel);
+            if (sortKey === field) {
+                th.classList.add('active-sort');
+                th.innerHTML = `${baseLabel} <span class="sort-indicator">${direction === 'asc' ? '↑' : '↓'}</span>`;
+            } else {
+                th.classList.remove('active-sort');
+                th.innerHTML = baseLabel;
+            }
+        });
+        const sortSelect = document.getElementById('sortSelect');
+        if (sortSelect && sortSelect.value !== state.sortBy) {
+            sortSelect.value = state.sortBy;
+        }
+    }
+
     function applyFilterAndSort() {
         const keyword = document.getElementById('searchInput').value.trim().toLowerCase();
         let items = [...state.items];
@@ -2081,6 +2572,7 @@
         directoryPage = 0;
         state.lastSelectedIndex = -1;
         state.filteredItems = items;
+        updateTableHeaderSort();
         renderMainView();
         updateDirStats();
     }
@@ -2391,7 +2883,8 @@
     // ==========================================================================
     window.triggerDownload = function (filename, size) {
         const fileUrl = (state.currentPath === '/' ? '' : state.currentPath) + '/' + encodeURIComponent(filename);
-        TransferManager.addDownloadFile(filename, fileUrl, size || 0);
+        const task = TransferManager.addDownloadFile(filename, fileUrl, size);
+        if (task.status === 'awaiting-save') task.chooseLocation();
     };
 
     window.triggerZipDownload = function (dirname) {
@@ -2535,14 +3028,36 @@
         // 视图行内与网格事件集中委托绑定 (免疫特殊文件名注入)
         setupFileViewDelegation();
 
-        // 3. 排序绑定
+        // 3. 排序绑定 (表头直接点击与下拉菜单双向实时联动)
         const sortSelect = document.getElementById('sortSelect');
-        sortSelect.value = state.sortBy;
-        sortSelect.onchange = () => {
-            state.sortBy = sortSelect.value;
-            localStorage.setItem('lan_sort_by', state.sortBy);
-            applyFilterAndSort();
-        };
+        document.querySelectorAll('.file-table th.sortable').forEach(th => {
+            th.onclick = () => {
+                const sortKey = th.getAttribute('data-sort');
+                const [currentField, currentDir] = (state.sortBy || 'name-asc').split('-');
+                let nextDir = 'asc';
+                if (sortKey === currentField) {
+                    nextDir = currentDir === 'asc' ? 'desc' : 'asc';
+                } else {
+                    // 自然习惯：修改时间与大小默认大到小 (最新/最大置顶)，名称默认 A 到 Z
+                    nextDir = (sortKey === 'mtime' || sortKey === 'size') ? 'desc' : 'asc';
+                }
+                state.sortBy = `${sortKey}-${nextDir}`;
+                localStorage.setItem('lan_sort_by', state.sortBy);
+                updateTableHeaderSort();
+                applyFilterAndSort();
+            };
+        });
+
+        if (sortSelect) {
+            sortSelect.value = state.sortBy;
+            sortSelect.onchange = () => {
+                state.sortBy = sortSelect.value;
+                localStorage.setItem('lan_sort_by', state.sortBy);
+                updateTableHeaderSort();
+                applyFilterAndSort();
+            };
+        }
+        updateTableHeaderSort();
 
         // 4. 搜索框绑定
         const searchInput = document.getElementById('searchInput');
@@ -2680,9 +3195,15 @@
         }
 
         // 双端自适应绑定: 移动端弹仿微信底栏，PC端直接打开文件选择
-        document.getElementById('uploadFileBtn').onclick = () => {
+        document.getElementById('uploadFileBtn').onclick = async () => {
             if (isMobileDevice()) {
                 openMobileMediaActionSheet();
+            } else if (LocalCopy.enabled) {
+                try {
+                    const res = await LocalCopy.selectFiles(state.currentPath);
+                    if (res && (res.ok || res.cancelled)) return;
+                } catch (_) {}
+                fileInput.click();
             } else {
                 fileInput.click();
             }
@@ -2721,9 +3242,15 @@
             };
         }
 
-        document.getElementById('uploadFolderBtn').onclick = () => {
+        document.getElementById('uploadFolderBtn').onclick = async () => {
             if (isMobileDevice()) {
                 openMobileFolderModal();
+            } else if (LocalCopy.enabled) {
+                try {
+                    const res = await LocalCopy.selectFolder(state.currentPath);
+                    if (res && (res.ok || res.cancelled)) return;
+                } catch (_) {}
+                folderInput.click();
             } else {
                 folderInput.click();
             }
@@ -2975,6 +3502,43 @@
 
         // 15. 下载路径设置初始化与事件绑定 (参考百度网盘与 GitHub)
         DownloadPathManager.init();
+        LocalCopy.init();
+        // 16. 全局剪贴板复制粘贴支持 (Ctrl+V)
+        window.addEventListener('paste', async (e) => {
+            const active = document.activeElement;
+            if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) {
+                return;
+            }
+
+            // 针对本机环境优先尝试系统剪贴板 (直接在磁盘底层高速复制)
+            if (LocalCopy.enabled) {
+                try {
+                    const res = await LocalCopy.paste(state.currentPath);
+                    if (res && res.ok && res.count > 0) {
+                        showToast(`已从剪贴板粘贴 ${res.count} 个文件/文件夹`, 'info');
+                        TransferManager.openDrawer('upload');
+                        return;
+                    }
+                } catch (_) {}
+            }
+
+            // 浏览器剪贴板文件对象读取 (如图片截图或外部机器粘贴)
+            if (e.clipboardData && e.clipboardData.items) {
+                const files = [];
+                for (const item of e.clipboardData.items) {
+                    if (item.kind === 'file') {
+                        const file = item.getAsFile();
+                        if (file) files.push(file);
+                    }
+                }
+                if (files.length > 0) {
+                    e.preventDefault();
+                    TransferManager.addUploadFiles(files, state.currentPath);
+                    showToast(`已从剪贴板粘贴 ${files.length} 个文件`, 'info');
+                }
+            }
+        });
+
 
         const dlSettingsModal = document.getElementById('downloadSettingsModal');
         const openDlSettings = () => {
@@ -3053,7 +3617,7 @@
         if (dlSettingsSave) {
             dlSettingsSave.onclick = () => {
                 closeDlSettings();
-                showToast(`下载设置已生效：${DownloadPathManager.mode === 'custom' ? '已绑定 ' + DownloadPathManager.customDirName : '使用系统默认下载路径'}`, 'info', 3000);
+                showToast(`下载设置已生效：${DownloadPathManager.askSaveLocation ? '每次下载前选择保存位置' : DownloadPathManager.mode === 'custom' ? '已绑定 ' + DownloadPathManager.customDirName : '使用系统默认下载路径'}`, 'info', 3000);
             };
         }
 

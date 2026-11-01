@@ -14,10 +14,9 @@ import os
 import time
 import hashlib
 import json
-import base64
 import urllib.request
-import subprocess
 from pathlib import Path
+from benchmark_test import test_server
 
 # 编码保护
 try:
@@ -30,10 +29,7 @@ except Exception:
 
 BASE_DIR = Path(__file__).resolve().parent
 DUFS_EXE = BASE_DIR / "bin" / "dufs.exe"
-SHARED_DIR = BASE_DIR / "shared_files"
 WEB_DIR = BASE_DIR / "web"
-TEST_PORT = 5888
-BASE_URL = f"http://127.0.0.1:{TEST_PORT}"
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -50,25 +46,12 @@ def main():
         print(f"[错误] web/index.html 不存在: {WEB_DIR}")
         sys.exit(1)
 
-    # 1. 启动 dufs 测试实例
-    cmd = [
-        str(DUFS_EXE),
-        str(SHARED_DIR),
-        "-A",
-        "-b", "127.0.0.1",
-        "-p", str(TEST_PORT),
-        "--assets", str(WEB_DIR)
-    ]
-    print(f"[*] 启动后台测试服务: {' '.join(cmd)}")
-    server_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1.5)
-
-    try:
+    with test_server(DUFS_EXE, assets=WEB_DIR) as (shared_dir, base_url):
         # -------------------------------------------------------------
         # 测试 1: GET / HTML 与模板变量注入校验
         # -------------------------------------------------------------
         print("\n[测试 1/5] 验证 HTML 页面渲染与模板变量注入...")
-        with urllib.request.urlopen(f"{BASE_URL}/", timeout=5) as resp:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5) as resp:
             html = resp.read().decode('utf-8')
             code = resp.getcode()
             assert code == 200, f"HTTP status expected 200, got {code}"
@@ -85,12 +68,12 @@ def main():
         print(f"  [+] 检测到静态资源前缀: {assets_prefix}")
 
         # 请求 style.css 和 app.js
-        with urllib.request.urlopen(f"{BASE_URL}{assets_prefix}style.css", timeout=5) as resp:
+        with urllib.request.urlopen(f"{base_url}{assets_prefix}style.css", timeout=5) as resp:
             assert resp.getcode() == 200
             assert "LAN Fast Share" in resp.read().decode('utf-8')
             print("  [+] 静态样式表 style.css 加载正常 (HTTP 200)")
 
-        with urllib.request.urlopen(f"{BASE_URL}{assets_prefix}app.js", timeout=5) as resp:
+        with urllib.request.urlopen(f"{base_url}{assets_prefix}app.js", timeout=5) as resp:
             assert resp.getcode() == 200
             assert "TransferManager" in resp.read().decode('utf-8')
             print("  [+] 核心脚本 app.js 加载正常 (HTTP 200)")
@@ -99,7 +82,7 @@ def main():
         # 测试 2: GET /?json 目录接口校验
         # -------------------------------------------------------------
         print("\n[测试 2/5] 验证目录 JSON 数据接口 (/ ?json)...")
-        with urllib.request.urlopen(f"{BASE_URL}/?json", timeout=5) as resp:
+        with urllib.request.urlopen(f"{base_url}/?json", timeout=5) as resp:
             assert resp.getcode() == 200
             data = json.loads(resp.read().decode('utf-8'))
             assert "paths" in data, "缺少 paths 字段"
@@ -121,8 +104,8 @@ def main():
         expected_sha256 = sha256_bytes(full_20mb)
 
         test_file_name = "resume_test_20mb.bin"
-        file_url = f"{BASE_URL}/{test_file_name}"
-        disk_file_path = SHARED_DIR / test_file_name
+        file_url = f"{base_url}/{test_file_name}"
+        disk_file_path = shared_dir / test_file_name
 
         print(f"  [+] 测试文件大小: {total_len:,} 字节 (20.00 MB)")
         print(f"  [+] 原始数据 SHA-256: {expected_sha256}")
@@ -205,7 +188,7 @@ def main():
         # 测试 5: MKCOL 目录创建与 DELETE 批量清理
         # -------------------------------------------------------------
         print("\n[测试 5/5] 验证 MKCOL 文件夹创建与 DELETE 清理...")
-        folder_url = f"{BASE_URL}/test_bench_folder"
+        folder_url = f"{base_url}/test_bench_folder"
         req_mkcol = urllib.request.Request(folder_url, method="MKCOL")
         with urllib.request.urlopen(req_mkcol, timeout=5) as resp:
             assert resp.getcode() in (200, 201)
@@ -221,15 +204,6 @@ def main():
         with urllib.request.urlopen(req_del_dir, timeout=5) as resp:
             assert resp.getcode() in (200, 204)
             print("  [+] DELETE 测试文件夹清理成功")
-
-    finally:
-        print("\n[*] 正在关闭后台测试服务进程...")
-        try:
-            server_proc.terminate()
-            server_proc.wait(timeout=2)
-        except Exception:
-            server_proc.kill()
-        print("  [+] 测试服务已退出")
 
     print("\n" + "=" * 65)
     print("      [OK] 全部 5 项现代化网盘与传输协议实测 100% 通过！")

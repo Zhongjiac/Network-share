@@ -1,4 +1,4 @@
-# ==============================================================================
+﻿# ==============================================================================
 # LAN Fast Share - Windows 原生零依赖启动器 (PowerShell 5.1/7+ 兼容)
 # 无需安装任何 Python 或第三方依赖，开箱即用满血运行
 # ==============================================================================
@@ -104,6 +104,8 @@ function Pack-PortableZip {
             "打包便携发行版.bat",
             "launcher.py",
             "launcher.ps1",
+            "native-helper.ps1",
+            "native-helper.cs",
             "README.md",
             "qrcode_guide.html"
         )
@@ -480,6 +482,8 @@ function Update-GuideHtml([string]$url, $candidateIPs, [int]$portNum, [string]$f
     } catch {}
 }
 
+$helperPort = Find-AvailablePort ($port + 50)
+$localUrl = "http://127.0.0.1:$helperPort"
 $primaryUrl = "http://${primaryIP}:${port}"
 
 # 动态刷新离线扫码引导页 (保证本机当前真实局域网 IP 与二维码同步)
@@ -491,6 +495,7 @@ try {
         primary_ip = $primaryIP
         port = $port
         primary_url = $primaryUrl
+        local_url = $localUrl
         all_urls = @($lanIPs | ForEach-Object { "http://" + $_.IP + ":$port" })
     }
     $infoJson = $infoObj | ConvertTo-Json
@@ -531,11 +536,19 @@ if ($sharedDir -eq $DefaultSharedDir) {
     } catch {}
 }
 
-# 异步轮询探测端口就绪后在默认浏览器中打开 Web 页面 (最多尝试 30 次，每次 100ms)
+$helperProcess = $null
+try {
+    $helperScript = Join-Path $ScriptDir 'native-helper.ps1'
+    $helperArgs = "-NoProfile -STA -ExecutionPolicy Bypass -File `"$helperScript`" -SharedDir `"$sharedDir`" -DufsPort $port -Port $helperPort -OwnerProcessId $PID"
+    $helperProcess = Start-Process powershell -ArgumentList $helperArgs -PassThru -WindowStyle Hidden
+    Write-Host "[本机复制入口]: $localUrl（手机请使用局域网地址）" -ForegroundColor Cyan
+} catch { Write-Host "[提示] 本机复制入口启动失败：$_" -ForegroundColor Yellow }
+
+# 异步轮询探测端口就绪后在默认浏览器中打开 Web 页面 (最多尝试 100 次，每次 100ms)
 try {
     Start-Job -ScriptBlock {
         param($TargetPort, $TargetUrl)
-        for ($i = 0; $i -lt 30; $i++) {
+        for ($i = 0; $i -lt 100; $i++) {
             Start-Sleep -Milliseconds 100
             try {
                 $client = New-Object System.Net.Sockets.TcpClient
@@ -549,7 +562,7 @@ try {
                 $client.Close()
             } catch {}
         }
-    } -ArgumentList $port, $primaryUrl | Out-Null
+    } -ArgumentList $(if ($helperProcess) { $helperPort } else { $port }), $(if ($helperProcess) { $localUrl } else { $primaryUrl }) | Out-Null
 } catch {
     # 兜底：若后台作业创建受限，则直接启动
     try { Start-Process $primaryUrl } catch {}
@@ -558,4 +571,10 @@ try {
 Write-Host "[*] 核心引擎已启动，按 Ctrl+C 可停止分享并退出服务...`n" -ForegroundColor Green
 
 # 启动 dufs
-& "$DufsExe" "$sharedDir" -A -b 0.0.0.0 -p $port --assets "$WebDir"
+try {
+    & "$DufsExe" "$sharedDir" -A --allow-hash -b 0.0.0.0 -p $port --assets "$WebDir"
+} finally {
+    if ($helperProcess -and -not $helperProcess.HasExited) {
+        try { Invoke-WebRequest -Uri "$localUrl/__local/shutdown" -Method Post -Headers @{Origin=$localUrl} -UseBasicParsing -TimeoutSec 10 | Out-Null } catch {}
+    }
+}

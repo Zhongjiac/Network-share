@@ -33,11 +33,11 @@
 
 | 阶段 | 编号 | 任务项 | 目标文件/命令 | 详细说明 | 状态 |
 | :--- | :--- | :--- | :--- | :--- | :---: |
-| **阶段 1** | **T1.1** | 清理工作区运行时派生文件 | `qrcode_guide.html` | 执行 `git checkout -- qrcode_guide.html`，防止本地 IP 噪点混入 Git 历史 | 待执行 |
-| **阶段 1** | **T1.2** | 暂存核心修复与技术文档 | `launcher.py`, `STARTUP_HANG_FIX_PLAN.md` | 执行 `git add launcher.py STARTUP_HANG_FIX_PLAN.md` | 待执行 |
-| **阶段 1** | **T1.3** | 规范化 Commit 提交 | `git commit` | 提交说明：`fix(launcher): 根除静默 pip 安装阻塞，实现零依赖优雅降级秒级启动` | 待执行 |
-| **阶段 2** | **T2.1** | 推送更改至 GitHub 远端 | `git push origin main` | 将本地提交推送至 `origin/main` | 待执行 |
-| **阶段 2** | **T2.2** | 验证远端同步状态 | `git status` | 确认工作区为 clean 状态，本地分支与远端完全同步 | 待执行 |
+| **阶段 1** | **T1.1** | 清理工作区运行时派生文件 | `qrcode_guide.html` | 执行 `git checkout -- qrcode_guide.html`，防止本地 IP 噪点混入 Git 历史 | ✅ 已完成 |
+| **阶段 1** | **T1.2** | 暂存核心修复与技术文档 | `launcher.py`, `STARTUP_HANG_FIX_PLAN.md` | 执行 `git add launcher.py STARTUP_HANG_FIX_PLAN.md` | ✅ 已完成 |
+| **阶段 1** | **T1.3** | 规范化 Commit 提交 | `git commit` | 提交说明：`fix(launcher): 根除静默 pip 安装阻塞，实现零依赖优雅降级秒级启动` | ✅ 已完成 |
+| **阶段 2** | **T2.1** | 推送更改至 GitHub 远端 | `git push origin main` | 将本地提交推送至 `origin/main` | ✅ 已完成 |
+| **阶段 2** | **T2.2** | 验证远端同步状态 | `git status` | 确认工作区为 clean 状态，本地分支与远端完全同步 | ✅ 已完成 |
 
 ---
 

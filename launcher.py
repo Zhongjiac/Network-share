@@ -645,6 +645,7 @@ def main():
         server_info = {
             "primary_ip": primary_ip,
             "port": port,
+            "helper_port": helper_port,
             "primary_url": primary_url,
             "local_url": local_url,
             "all_urls": all_urls
@@ -715,7 +716,7 @@ def main():
             '-SharedDir', str(shared_dir), '-DufsPort', str(port),
             '-Port', str(helper_port), '-OwnerProcessId', str(os.getpid())
         ], creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-        print(f"[本机复制入口]: {local_url}（手机请使用局域网地址）")
+        print(f"[本机极速辅助]: {local_url} (已在后台就绪)")
     except OSError as error:
         print(f"[提示] 本机复制入口启动失败：{error}，仍可使用网络上传")
 
@@ -738,12 +739,11 @@ def main():
         import threading
         def open_browser():
             # 动态轮询探测服务端口连通性 (最多尝试 100 次，每次 100ms)
-            browser_url = primary_url
-            target_port = helper_port if helper is not None else port
+            browser_url = f"http://127.0.0.1:{port}"
             for _ in range(100):
                 try:
-                    with socket.create_connection(("127.0.0.1", target_port), timeout=0.15):
-                        browser_url = local_url if target_port == helper_port else primary_url
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.15):
+                        browser_url = f"http://127.0.0.1:{port}"
                         break
                 except Exception:
                     time.sleep(0.1)

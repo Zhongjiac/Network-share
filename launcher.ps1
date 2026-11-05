@@ -1,4 +1,4 @@
-﻿# ==============================================================================
+# ==============================================================================
 # LAN Fast Share - Windows 原生零依赖启动器 (PowerShell 5.1/7+ 兼容)
 # 无需安装任何 Python 或第三方依赖，开箱即用满血运行
 # ==============================================================================
@@ -494,6 +494,7 @@ try {
     $infoObj = @{
         primary_ip = $primaryIP
         port = $port
+        helper_port = $helperPort
         primary_url = $primaryUrl
         local_url = $localUrl
         all_urls = @($lanIPs | ForEach-Object { "http://" + $_.IP + ":$port" })
@@ -541,7 +542,7 @@ try {
     $helperScript = Join-Path $ScriptDir 'native-helper.ps1'
     $helperArgs = "-NoProfile -STA -ExecutionPolicy Bypass -File `"$helperScript`" -SharedDir `"$sharedDir`" -DufsPort $port -Port $helperPort -OwnerProcessId $PID"
     $helperProcess = Start-Process powershell -ArgumentList $helperArgs -PassThru -WindowStyle Hidden
-    Write-Host "[本机复制入口]: $localUrl（手机请使用局域网地址）" -ForegroundColor Cyan
+    Write-Host "[本机极速辅助]: $localUrl (已在后台就绪)" -ForegroundColor Cyan
 } catch { Write-Host "[提示] 本机复制入口启动失败：$_" -ForegroundColor Yellow }
 
 # 异步轮询探测端口就绪后在默认浏览器中打开 Web 页面 (最多尝试 100 次，每次 100ms)
@@ -562,10 +563,10 @@ try {
                 $client.Close()
             } catch {}
         }
-    } -ArgumentList $(if ($helperProcess) { $helperPort } else { $port }), $(if ($helperProcess) { $localUrl } else { $primaryUrl }) | Out-Null
+    } -ArgumentList $port, "http://127.0.0.1:$port" | Out-Null
 } catch {
     # 兜底：若后台作业创建受限，则直接启动
-    try { Start-Process $primaryUrl } catch {}
+    try { Start-Process "http://127.0.0.1:$port" } catch {}
 }
 
 Write-Host "[*] 核心引擎已启动，按 Ctrl+C 可停止分享并退出服务...`n" -ForegroundColor Green
